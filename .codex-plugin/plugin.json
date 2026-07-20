@@ -1,0 +1,34 @@
+{
+  "name": "tingle-skills",
+  "version": "0.1.0",
+  "description": "Ryan 的可复用工作 skill 合集（容器插件）；首个 skill 为 on-trend-radar 选题雷达——把每日热榜接到项目人群痛点上产出待复核选题。",
+  "author": {
+    "name": "Ryan"
+  },
+  "keywords": [
+    "skills",
+    "选题",
+    "on-trend",
+    "content",
+    "radar"
+  ],
+  "skills": "./skills/",
+  "interface": {
+    "displayName": "Tingle Skills",
+    "shortDescription": "Ryan 的可复用工作 skill 合集（容器插件）",
+    "longDescription": "Tingle Skills 是 Ryan 的可复用工作 skill 容器插件，第一版收录 on-trend-radar（选题雷达）：把当天热点榜接到项目人群痛点上，产出待复核的选题清单。插件会持续加入更多跨项目复用的 skill，容器名称保持不变。",
+    "developerName": "Ryan",
+    "category": "Productivity",
+    "capabilities": [
+      "Interactive",
+      "Read",
+      "Write"
+    ],
+    "defaultPrompt": [
+      "Use on-trend-radar to turn today's trend list into a review-ready topic queue for this project.",
+      "Use on-trend-radar to check whether today's hot topics fit this project's audience pain points."
+    ],
+    "brandColor": "#0D9488",
+    "screenshots": []
+  }
+}
