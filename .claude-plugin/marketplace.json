@@ -1,11 +1,11 @@
 {
-  "name": "tingle-skills",
+  "name": "tingle",
   "owner": {
     "name": "Ryan"
   },
   "plugins": [
     {
-      "name": "tingle-skills",
+      "name": "tingle",
       "source": "./",
       "description": "Ryan 的可复用工作 skill 合集（容器插件）；首个 skill 为 on-trend-radar 选题雷达——把每日热榜接到项目人群痛点上产出待复核选题。",
       "category": "productivity",
