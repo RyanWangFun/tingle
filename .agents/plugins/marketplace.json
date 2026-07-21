@@ -1,21 +1,21 @@
 {
   "name": "tingle",
-  "owner": {
-    "name": "Ryan"
+  "interface": {
+    "displayName": "Tingle"
   },
   "plugins": [
     {
       "name": "tingle",
-      "source": "./plugins/tingle",
       "description": "Ryan 的可复用工作 skill 合集（容器插件）；首个 skill 为 on-trend-radar 选题雷达——把每日热榜接到项目人群痛点上产出待复核选题。",
-      "category": "productivity",
-      "tags": [
-        "skills",
-        "选题",
-        "on-trend",
-        "content",
-        "radar"
-      ]
+      "source": {
+        "source": "local",
+        "path": "./plugins/tingle"
+      },
+      "policy": {
+        "installation": "AVAILABLE",
+        "authentication": "ON_INSTALL"
+      },
+      "category": "Productivity"
     }
   ]
 }
