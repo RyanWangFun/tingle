@@ -1,22 +1,22 @@
 {
   "name": "tingle",
-  "version": "0.1.0",
-  "description": "Ryan 的可复用工作 skill 合集（容器插件）：会话入口 using-tingle、项目就绪 project-readiness、上下文蒸馏 context-distill、选题雷达 on-trend-radar。",
+  "version": "0.2.0",
+  "description": "Ryan 的可复用工作 skill 合集（容器插件）。当前的三件套合起来是一套项目初始化基础设施：会话入口 using-tingle、项目就绪 project-readiness、上下文蒸馏 context-distill。",
   "author": {
     "name": "Ryan"
   },
   "keywords": [
     "skills",
-    "选题",
-    "on-trend",
-    "content",
-    "radar"
+    "项目初始化",
+    "readiness",
+    "onboarding",
+    "distill"
   ],
   "skills": "./skills/",
   "interface": {
     "displayName": "Tingle",
     "shortDescription": "Ryan 的可复用工作 skill 合集（容器插件）",
-    "longDescription": "Tingle 是 Ryan 的可复用工作 skill 容器插件，现收录四个 skill：using-tingle（会话入口，自动确认当前项目与就绪状态）、project-readiness（项目就绪：各 skill 运行前检查前提，也可直接把一个新项目配到能干活）、context-distill（把散落的项目材料蒸馏成共用的项目上下文）、on-trend-radar（选题雷达：把当天热点接到项目人群痛点上产出待复核选题）。插件会持续加入更多跨项目复用的 skill，容器名称保持不变。",
+    "longDescription": "Tingle 是 Ryan 的可复用工作 skill 容器插件，现收录三个 skill，合起来是一套项目初始化基础设施——把一个客户项目在自己机器上从零弄到能干活：using-tingle（会话入口，自动确认当前在哪个项目、该项目是否已就绪）、project-readiness（项目就绪：带你把一个新项目从零配齐，也在每次运行前检查前提齐不齐）、context-distill（把散落各处的项目材料收拢上飞书云盘，蒸馏成共用的项目上下文）。插件会持续加入更多跨项目复用的 skill，容器名称保持不变。",
     "developerName": "Ryan",
     "category": "Productivity",
     "capabilities": [
@@ -26,7 +26,7 @@
     ],
     "defaultPrompt": [
       "把这个项目弄就绪（project-readiness 会带你把项目从零配到能干活）。",
-      "Use on-trend-radar to turn today's trend list into a review-ready topic queue for this project."
+      "把这个项目散落各处的材料收拢上飞书云盘、蒸成共用的项目上下文（context-distill 会带你走完收料与蒸馏）。"
     ],
     "brandColor": "#0D9488",
     "screenshots": []

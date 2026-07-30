@@ -6,7 +6,7 @@
   "plugins": [
     {
       "name": "tingle",
-      "description": "Ryan 的可复用工作 skill 合集（容器插件）：会话入口 using-tingle、项目就绪 project-readiness、上下文蒸馏 context-distill、选题雷达 on-trend-radar。",
+      "description": "Ryan 的可复用工作 skill 合集（容器插件）。当前的三件套合起来是一套项目初始化基础设施：会话入口 using-tingle、项目就绪 project-readiness、上下文蒸馏 context-distill。",
       "source": {
         "source": "local",
         "path": "./plugins/tingle"

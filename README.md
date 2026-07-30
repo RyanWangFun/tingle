@@ -6,13 +6,13 @@ Tingle 是 Ryan 的可复用工作 skill 合集，以 Claude Code 插件的形�
 
 **先配好前置依赖，再装插件。** 本插件内的 skill 依赖 lark 工具链读写飞书：
 
-- 安装 `lark-cli`（`larksuite/cli`）：在系统终端跑 `npx skills add larksuite/cli -g`
-- 执行 `lark-cli auth login` 完成飞书授权
-- 拥有相关飞书表的访问权：当天热点榜表、各项目自己的「项目选题上下文」云文档、选题清单表
+- 安装 `lark-cli`（`larksuite/cli`）：在系统终端跑 `npx skills add larksuite/cli -g`——这一步同时把 `lark-*` 系列 skill（`lark-doc` / `lark-base` / `lark-drive` 等）装到位，插件内的 skill 全靠它们读写飞书，缺了就跑不动
+- 执行 `lark-cli auth login` 完成飞书授权，并保持授权有效（授权走你本人的飞书身份，过期了重跑一次）
+- 拥有该项目飞书云盘文件夹的访问权——材料、蒸出来的项目上下文、项目档案都落在那里
 
 ## 安装
 
-> 说明：`/plugin …` 是在 **Claude Code 对话框里**输入的斜杠命令（不是系统终端）；`$skill-installer`、`npx` 是在**系统终端**里跑。
+> 说明：`/plugin …` 是在 **Claude Code 对话框里**输入的斜杠命令（不是系统终端）；`npx` 是在**系统终端**里跑。
 
 ### Claude Code
 
@@ -24,7 +24,7 @@ Tingle 是 Ryan 的可复用工作 skill 合集，以 Claude Code 插件的形�
 /reload-plugins
 ```
 
-装好后即可使用。选题雷达是 model-invoked 技能，Claude 会按任务自动调用（如需显式调用，名为 `/tingle:on-trend-radar`）。
+装好后即可使用。会话入口随会话自动加载，其余 skill 都是 model-invoked 技能，Claude 会按任务自动调用（如需显式调用，名为 `/tingle:<skill 名>`，如 `/tingle:project-readiness`）。
 
 ### Codex
 
@@ -54,6 +54,7 @@ tingle 的会话入口（using-tingle）经 SessionStart hook 随会话自动注
 - **using-tingle（会话入口）**：每次会话开始时自动加载（无需你调用），确认当前在哪个项目里工作、该项目是否已就绪；未就绪则引导你走初始化，不让 skill 在缺前提的情况下空跑。
 - **project-readiness（项目就绪）**：本插件的就绪总管。① 各 skill 运行前由它检查这一次的前提齐不齐（缺则说明卡在哪、不让这次跑）；② 也可以直接对它说「把这个项目弄就绪」，它会带你把一个新项目从零配齐——建云盘落点、收料、蒸上下文、打标签、建承接表、写项目档案。凡要写飞书的动作都会先停下来等你放行。
 - **context-distill（项目上下文蒸馏）**：把散在各处的项目材料收拢上飞书云盘，蒸馏成全家族共用的项目上下文；材料更新后就地重蒸，不推倒重来。
-- **on-trend-radar（选题雷达）**：把当天的热点/热搜接到某个项目的目标人群与痛点上，判断哪条热点值得立成一条选题，产出待复核的选题清单。
+
+这三件合起来是一套**项目初始化基础设施**——把一个客户项目在你自己机器上从零弄到能干活。初始化完成的标准是「地基齐」（云盘落点、材料、项目上下文、项目档案、本地锚），不以任何具体业务技能就绪为准。
 
 本插件是一个会长大的容器，后续会持续加入更多跨项目复用的 skill；新增 skill 不改变插件名称与安装方式。
