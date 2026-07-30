@@ -1,7 +1,7 @@
 {
   "name": "tingle",
   "version": "0.1.0",
-  "description": "Ryan 的可复用工作 skill 合集（容器插件）；首个 skill 为 on-trend-radar 选题雷达——把每日热榜接到项目人群痛点上产出待复核选题。",
+  "description": "Ryan 的可复用工作 skill 合集（容器插件）：会话入口 using-tingle、项目就绪 project-readiness、上下文蒸馏 context-distill、选题雷达 on-trend-radar。",
   "author": {
     "name": "Ryan"
   },
@@ -16,7 +16,7 @@
   "interface": {
     "displayName": "Tingle",
     "shortDescription": "Ryan 的可复用工作 skill 合集（容器插件）",
-    "longDescription": "Tingle 是 Ryan 的可复用工作 skill 容器插件，第一版收录 on-trend-radar（选题雷达）：把当天热点榜接到项目人群痛点上，产出待复核的选题清单。插件会持续加入更多跨项目复用的 skill，容器名称保持不变。",
+    "longDescription": "Tingle 是 Ryan 的可复用工作 skill 容器插件，现收录四个 skill：using-tingle（会话入口，自动确认当前项目与就绪状态）、project-readiness（项目就绪：各 skill 运行前检查前提，也可直接把一个新项目配到能干活）、context-distill（把散落的项目材料蒸馏成共用的项目上下文）、on-trend-radar（选题雷达：把当天热点接到项目人群痛点上产出待复核选题）。插件会持续加入更多跨项目复用的 skill，容器名称保持不变。",
     "developerName": "Ryan",
     "category": "Productivity",
     "capabilities": [
@@ -25,8 +25,8 @@
       "Write"
     ],
     "defaultPrompt": [
-      "Use on-trend-radar to turn today's trend list into a review-ready topic queue for this project.",
-      "Use on-trend-radar to check whether today's hot topics fit this project's audience pain points."
+      "把这个项目弄就绪（project-readiness 会带你把项目从零配到能干活）。",
+      "Use on-trend-radar to turn today's trend list into a review-ready topic queue for this project."
     ],
     "brandColor": "#0D9488",
     "screenshots": []

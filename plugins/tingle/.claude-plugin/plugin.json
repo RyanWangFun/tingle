@@ -1,7 +1,7 @@
 {
   "name": "tingle",
   "version": "0.1.0",
-  "description": "Ryan 的可复用工作 skill 合集（容器插件）；首个 skill 为 on-trend-radar 选题雷达——把每日热榜接到项目人群痛点上产出待复核选题。",
+  "description": "Ryan 的可复用工作 skill 合集（容器插件）：会话入口 using-tingle、项目就绪 project-readiness、上下文蒸馏 context-distill、选题雷达 on-trend-radar。",
   "author": {
     "name": "Ryan"
   },
