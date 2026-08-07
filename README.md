@@ -44,10 +44,43 @@ codex plugin marketplace add RyanWangFun/tingle
 
 ## 双侧差异（Claude Code vs Codex）
 
-tingle 的会话入口（using-tingle）经 SessionStart hook 随会话自动注入，在 Claude Code 与 Codex 两侧同构生效——同一份 hook 文件双侧通用，无需分别配置。需要知道的差异只有两点：
+tingle 的会话入口（using-tingle）经 SessionStart hook 随会话自动注入，两侧共用同一份 hook 文件，无需分别配置。Claude Code 装完即用；Codex 多两步，都只做一次。
 
-1. **信任门槛**：Codex 安装或启用插件后，插件自带的 hooks 不会自动生效——按 Codex 官方文档的说明，插件捆绑的 hooks 属于非托管 hooks，需要用户在 Codex 中审核并信任本插件的 hook 定义后才会运行（Claude Code 无此额外步骤）。在信任生效前，可在对话里直接说「使用 using-tingle」手动加载入口。
-2. **输出上限**：按 Codex 官方文档的说明，Codex 侧 hook 对模型可见的注入内容有约 2,500 token 的上限，超出部分会被截断。当前入口注入内容的实测长度随 tokenizer 口径而异：按 `o200k_base` 计为 2376 token（距上限约 124），按 `cl100k_base` 计为 3018 token（**超出约 518**）。Codex 实际按哪种口径计数尚未在真机上实测：若按 `o200k_base` 计则未超、注入完整；若按 `cl100k_base` 计，尾部约五百 token（约占全文六分之一）会被截去——不是少几个字的量级，入口末尾整段内容都可能不在。故不排除注入尾部被截去的可能；若发现入口内容不完整，在对话里直接说「使用 using-tingle」手动加载即可。改动入口内容时，请按上述两种口径各复算一次，不要在现有长度上继续加长。
+**第一步：信任本插件的 hook。** Codex 装好或启用插件后，插件自带的 hook 不会立刻生效——按 Codex 官方文档，插件捆绑的 hook 属于非托管 hook，须由你审核并信任后才运行（Claude Code 无此步骤）。在 Codex 里用 `/hooks` 查看并信任即可。
+
+要点：**信任是按 hook 定义的内容记录的**，所以插件更新一旦改动了 hook 定义，它会重新变回待审核状态、hook 被跳过，届时再用 `/hooks` 信任一次即可（0.4.1 就改动了 hook 定义，从更早版本升上来的话请重新信任）。信任生效前，在对话里直接说「使用 using-tingle」可手动加载入口。
+
+**第二步（仅当 `/hooks` 里根本看不到本插件的 hook 时）：手动登记一次。** 看不到说明你这个 Codex 版本尚未开启"自动发现插件自带 hook"的能力（该能力在 Codex 中曾置于特性开关之后）。这时把下面这段加进 `~/.codex/hooks.json`，效果完全相同——本插件的 hook 脚本会自行推导插件位置、不依赖任何环境变量，所以按绝对路径调用照样工作：
+
+```json
+{
+  "hooks": {
+    "SessionStart": [
+      {
+        "matcher": "startup|resume|clear|compact",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "'<插件安装路径>/hooks/session-start.sh'",
+            "timeout": 10,
+            "additionalContextLimit": 0
+          }
+        ]
+      }
+    ]
+  }
+}
+```
+
+`<插件安装路径>` 换成本插件在你机器上的实际位置。不确定装在哪，在终端跑这条即可查出脚本的完整路径，直接把它填进去：
+
+```bash
+find ~/.codex -name session-start.sh -path '*tingle*' 2>/dev/null
+```
+
+加完同样需要用 `/hooks` 信任一次。
+
+**关于注入长度**：Codex 对 hook 注入内容默认有约 2,500 token 的上限，超出部分不会被截断，而是被存进临时文件、只给模型一段头尾预览加文件路径——对入口来说这比截断更糟，模型多半不会去读那个文件。本插件的 hook 已声明 `additionalContextLimit: 0`（完整内容原样交给模型），所以入口全文总是完整到场，改动入口内容时也无需再核算长度。**这个字段不要删。**
 
 ## 含哪些 skill
 
