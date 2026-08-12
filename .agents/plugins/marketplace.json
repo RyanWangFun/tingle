@@ -6,7 +6,7 @@
   "plugins": [
     {
       "name": "tingle",
-      "description": "Ryan 的可复用工作 skill 合集（容器插件）。含一套项目初始化基础设施——会话入口 using-tingle、项目就绪 project-readiness、上下文蒸馏 context-distill；另有 building-work-skill，把一套已经在用的做法造成别人也能用的 skill。",
+      "description": "Ryan 的可复用工作 skill 合集（容器插件）。含一套项目初始化基础设施——会话入口 using-tingle、项目就绪 project-readiness、材料蒸馏 context-distill（蒸出项目共用的上下文，也可照给定规格只产其中一件）；另有 building-work-skill，把一套已经在用的做法造成别人也能用的 skill。",
       "source": {
         "source": "local",
         "path": "./plugins/tingle"

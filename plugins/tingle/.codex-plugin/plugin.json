@@ -1,7 +1,7 @@
 {
   "name": "tingle",
-  "version": "0.5.0",
-  "description": "Ryan 的可复用工作 skill 合集（容器插件）。含一套项目初始化基础设施——会话入口 using-tingle、项目就绪 project-readiness、上下文蒸馏 context-distill；另有 building-work-skill，把一套已经在用的做法造成别人也能用的 skill。",
+  "version": "0.6.0",
+  "description": "Ryan 的可复用工作 skill 合集（容器插件）。含一套项目初始化基础设施——会话入口 using-tingle、项目就绪 project-readiness、材料蒸馏 context-distill（蒸出项目共用的上下文，也可照给定规格只产其中一件）；另有 building-work-skill，把一套已经在用的做法造成别人也能用的 skill。",
   "author": {
     "name": "Ryan"
   },
@@ -16,7 +16,7 @@
   "interface": {
     "displayName": "Tingle",
     "shortDescription": "Ryan 的可复用工作 skill 合集（容器插件）",
-    "longDescription": "Tingle 是 Ryan 的可复用工作 skill 容器插件，现收录四个 skill。其中三个合起来是一套项目初始化基础设施——把一个客户项目在自己机器上从零弄到能干活：using-tingle（会话入口，自动确认当前在哪个项目里工作、这个项目在你机器上初始化过没有，没初始化过就带你去初始化）、project-readiness（项目就绪：带你把一个新项目从零配齐，也在每次运行前检查前提齐不齐）、context-distill（把散落各处的项目材料收拢上飞书云盘，蒸馏成共用的项目上下文）。另一个是 building-work-skill：把一套已经在用的做法变成别人也能用的 skill——从划清它到底管哪一段，到规则该放哪一层、用到的每样东西从哪儿来、哪几步必须人来判、怎么测，逐道过一遍。插件会持续加入更多跨项目复用的 skill，容器名称保持不变。",
+    "longDescription": "Tingle 是 Ryan 的可复用工作 skill 容器插件，现收录四个 skill。其中三个合起来是一套项目初始化基础设施——把一个客户项目在自己机器上从零弄到能干活：using-tingle（会话入口，自动确认当前在哪个项目里工作、这个项目在你机器上初始化过没有，没初始化过就带你去初始化）、project-readiness（项目就绪：带你把一个新项目从零配齐，也在每次运行前检查前提齐不齐）、context-distill（把散落各处的项目材料收拢上飞书云盘，蒸馏成共用的项目上下文；它也接受调用方给定的规格，只产其中某一件——例如某个 skill 专用的输入件）。另一个是 building-work-skill：把一套已经在用的做法变成别人也能用的 skill——从划清它到底管哪一段，到规则该放哪一层、用到的每样东西从哪儿来、哪几步必须人来判、怎么测，逐道过一遍。插件会持续加入更多跨项目复用的 skill，容器名称保持不变。",
     "developerName": "Ryan",
     "category": "Productivity",
     "capabilities": [
