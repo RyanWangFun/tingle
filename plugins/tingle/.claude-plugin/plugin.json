@@ -1,7 +1,7 @@
 {
   "name": "tingle",
-  "version": "0.4.1",
-  "description": "Ryan 的可复用工作 skill 合集（容器插件）。当前的三件套合起来是一套项目初始化基础设施：会话入口 using-tingle、项目就绪 project-readiness、上下文蒸馏 context-distill。",
+  "version": "0.5.0",
+  "description": "Ryan 的可复用工作 skill 合集（容器插件）。含一套项目初始化基础设施——会话入口 using-tingle、项目就绪 project-readiness、上下文蒸馏 context-distill；另有 building-work-skill，把一套已经在用的做法造成别人也能用的 skill。",
   "author": {
     "name": "Ryan"
   },

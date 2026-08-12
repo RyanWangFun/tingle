@@ -3,12 +3,12 @@
   "owner": {
     "name": "Ryan"
   },
-  "description": "Ryan 的可复用工作 skill 市场：装一个容器插件 tingle，拿到跨项目复用的工作 skill，当前是把客户项目在自己机器上弄到能干活的项目初始化基础设施。",
+  "description": "Ryan 的可复用工作 skill 市场：装一个容器插件 tingle，拿到跨项目复用的工作 skill——把客户项目在自己机器上弄到能干活的项目初始化基础设施，以及把一套已经在用的做法造成 skill 的工具。",
   "plugins": [
     {
       "name": "tingle",
       "source": "./plugins/tingle",
-      "description": "Ryan 的可复用工作 skill 合集（容器插件）。当前的三件套合起来是一套项目初始化基础设施：会话入口 using-tingle、项目就绪 project-readiness、上下文蒸馏 context-distill。",
+      "description": "Ryan 的可复用工作 skill 合集（容器插件）。含一套项目初始化基础设施——会话入口 using-tingle、项目就绪 project-readiness、上下文蒸馏 context-distill；另有 building-work-skill，把一套已经在用的做法造成别人也能用的 skill。",
       "category": "productivity",
       "tags": [
         "skills",
