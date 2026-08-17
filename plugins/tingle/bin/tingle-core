@@ -210,29 +210,64 @@ function readState(cwd) {
   return { status: 'ok', path: p, value: v };
 }
 
-/** 找本机常驻件所在的宿主文件（CLAUDE.md / AGENTS.md），读出它的版本。 */
-function readResident(cwd) {
-  for (const host of RESIDENT_HOSTS) {
-    const p = path.join(cwd, host);
-    const raw = readFileSafe(p);
-    if (raw === null) continue;
-    const b = raw.indexOf(RESIDENT_BEGIN);
-    const e = raw.indexOf(RESIDENT_END);
-    if (b === -1 || e === -1 || e < b) continue;
-    const region = raw.slice(b, e + RESIDENT_END.length);
-    const m = region.match(RESIDENT_VERSION_RE);
-    return {
-      status: 'present',
-      path: p,
-      host,
-      version: m ? parseInt(m[1], 10) : null,
-      region,
-      raw,
-      begin: b,
-      end: e + RESIDENT_END.length,
-    };
+/**
+ * 读一个宿主文件（CLAUDE.md 或 AGENTS.md）里的常驻件标记区。
+ * 回 present（区在，附版本与位置）或 absent（文件不在，或文件在但没有标记区）。
+ */
+function readResidentHost(cwd, host) {
+  const p = path.join(cwd, host);
+  const raw = readFileSafe(p);
+  if (raw === null) return { status: 'absent', host, path: p, reason: '文件不在' };
+  const b = raw.indexOf(RESIDENT_BEGIN);
+  const e = raw.indexOf(RESIDENT_END);
+  if (b === -1 || e === -1 || e < b) {
+    return { status: 'absent', host, path: p, raw, reason: '文件在、没有标记区' };
   }
-  return { status: 'absent' };
+  const region = raw.slice(b, e + RESIDENT_END.length);
+  const m = region.match(RESIDENT_VERSION_RE);
+  return {
+    status: 'present',
+    host,
+    path: p,
+    version: m ? parseInt(m[1], 10) : null,
+    region,
+    raw,
+    begin: b,
+    end: e + RESIDENT_END.length,
+  };
+}
+
+/**
+ * 读本机常驻件——两个宿主都要看。
+ *
+ * 为什么两个都要：`CLAUDE.md` 管 Claude 侧、`AGENTS.md` 管 Codex 侧，双市场一次覆盖。
+ * 只铺一侧，用另一侧的同事拿不到常驻件，而且没有任何症状。
+ *
+ * 回一个汇总：
+ *   status   'present'（两侧都在且版本对）/ 'stale'（有一侧版本不对）/ 'absent'（有一侧没铺）
+ *   hosts    逐宿主明细
+ *   missing  没铺的宿主名
+ *   stale    版本不对的宿主明细
+ */
+function readResident(cwd) {
+  const hosts = RESIDENT_HOSTS.map(h => readResidentHost(cwd, h));
+  const present = hosts.filter(h => h.status === 'present');
+  const missing = hosts.filter(h => h.status === 'absent');
+  const stale = present.filter(h => h.version !== RESIDENT_VERSION);
+  let status = 'present';
+  if (missing.length) status = 'absent';
+  else if (stale.length) status = 'stale';
+  return {
+    status,
+    hosts,
+    present,
+    missing,
+    stale,
+    // 兼容旧读法：第一个铺到的宿主
+    host: present.length ? present[0].host : undefined,
+    path: present.length ? present[0].path : undefined,
+    version: present.length ? present[0].version : undefined,
+  };
 }
 
 function residentTemplatePath() {
@@ -492,14 +527,27 @@ function resolveCore(cwd) {
     };
   }
 
-  // 第四层：常驻件（区在才判版本；不在不算错，属尚未铺开）
+  // 第四层：常驻件——两个宿主都要在、且版本都对。
+  // 改造前这一层写的是「区在才判版本，不在不算错」，于是常驻件没铺开时 resolve 一声不吭；
+  // 而 migrate 当时又要额外加参数才铺、初始化主手册压根没提它——三处同时断，
+  // 结果是这套机制建好了却没有任何执行者会触发，也没有任何人会发现没触发。
+  // 现在这一层是那条链的最后一道闸：没铺就报出来，修法是一条纯本机命令。
   const res = readResident(cwd);
-  if (res.status === 'present' && res.version !== RESIDENT_VERSION) {
+  if (res.stale.length) {
+    const one = res.stale[0];
     return {
       结论: VERDICT.STALE, 点名: '常驻件',
-      说明: `结构版本 ${res.version === null ? '认不出' : res.version}，当前应为 ${RESIDENT_VERSION}`,
-      宿主文件: res.path,
+      说明: `${res.stale.map(h => h.host).join('、')} 里的结构版本 ${one.version === null ? '认不出' : one.version}，当前应为 ${RESIDENT_VERSION}`,
+      宿主文件: res.stale.map(h => h.path),
       修法: 'tingle migrate（照模版重建标记区，区外一字不动，纯本机动作）',
+    };
+  }
+  if (res.missing.length) {
+    return {
+      结论: VERDICT.INCOMPLETE, 点名: '常驻件',
+      说明: `这几个宿主里没有常驻件：${res.missing.map(h => h.host).join('、')}`,
+      宿主文件: res.missing.map(h => h.path),
+      修法: 'tingle migrate（照模版铺进标记区，区外一字不动，纯本机动作）',
     };
   }
 
@@ -508,7 +556,7 @@ function resolveCore(cwd) {
     项目: { id: dig(profile, 'project', 'id'), name: dig(profile, 'project', 'name') },
     档案链接: st.value.profile_link,
     项目云盘: profile.folder_token,
-    常驻件: res.status === 'present' ? `在（${res.host}）` : '未铺',
+    常驻件: `在（${res.present.map(h => h.host).join('、')}）`,
     // 下面两项供 check 复用，免得同一份档案拉两遍；不进人读输出。
     _profile: profile,
     _state: st.value,
@@ -635,27 +683,51 @@ function rebuildState(cwd, keepLink) {
   return { ok: true, path: p, value: next };
 }
 
-/** 本机件之二：照模版重建常驻件标记区。区外一字不动，覆盖前存档。 */
+/** 照模版把常驻件铺进一个宿主文件。区外一字不动，覆盖前存档。 */
+function rebuildResidentHost(cwd, host, block) {
+  const cur = readResidentHost(cwd, host);
+
+  if (cur.status === 'present') {
+    if (cur.version === RESIDENT_VERSION && cur.region === block) {
+      return { ok: true, host, path: cur.path, 动作: '无需处理' };
+    }
+    // 区内被人改过就是信号：留一份存档给人看，说明这里该判层。
+    try { fs.copyFileSync(cur.path, cur.path + '.bak-' + Date.now()); } catch (e) { /* 尽力而为 */ }
+    const next = cur.raw.slice(0, cur.begin) + block + cur.raw.slice(cur.end);
+    fs.writeFileSync(cur.path, next, 'utf8');
+    return { ok: true, host, path: cur.path, 动作: '重建标记区', 区内原文长度: cur.region.length };
+  }
+
+  // 没有标记区：文件不在就新建，文件在就在末尾追加，原有正文一字不动。
+  const raw = cur.raw === undefined ? null : cur.raw;
+  if (raw !== null) {
+    try { fs.copyFileSync(cur.path, cur.path + '.bak-' + Date.now()); } catch (e) { /* 尽力而为 */ }
+  }
+  const next = (raw === null || raw.trim() === '' ? '' : raw.replace(/\s*$/, '\n\n')) + block + '\n';
+  fs.writeFileSync(cur.path, next, 'utf8');
+  return { ok: true, host, path: cur.path, 动作: raw === null ? '新建并写入标记区' : '首次写入标记区' };
+}
+
+/**
+ * 本机件之二：照模版重建常驻件标记区，两个宿主都铺。
+ *
+ * 双宿主的理由见 readResident：`CLAUDE.md` 管 Claude 侧、`AGENTS.md` 管 Codex 侧。
+ * 只铺一侧＝用另一侧的同事静默拿不到常驻件。
+ */
 function rebuildResident(cwd) {
   const tpl = readFileSafe(residentTemplatePath());
   if (tpl === null) return { ok: false, error: '插件仓里没有常驻件模版' };
-  const res = readResident(cwd);
-  const host = res.status === 'present' ? res.path : path.join(cwd, RESIDENT_HOSTS[0]);
   const block = RESIDENT_BEGIN + '\n' + tpl.trim() + '\n' + RESIDENT_END;
-
-  if (res.status === 'present') {
-    // 区内被人改过就是信号：留一份 diff 给人看，说明这里该判层。
-    const oldRegion = res.region;
-    try { fs.copyFileSync(res.path, res.path + '.bak-' + Date.now()); } catch (e) { /* ignore */ }
-    const next = res.raw.slice(0, res.begin) + block + res.raw.slice(res.end);
-    fs.writeFileSync(res.path, next, 'utf8');
-    return { ok: true, path: res.path, 动作: '重建标记区', 区内原文长度: oldRegion.length };
-  }
-
-  const raw = readFileSafe(host);
-  const next = (raw === null ? '' : raw.replace(/\s*$/, '\n\n')) + block + '\n';
-  fs.writeFileSync(host, next, 'utf8');
-  return { ok: true, path: host, 动作: '首次写入标记区' };
+  const results = RESIDENT_HOSTS.map(h => rebuildResidentHost(cwd, h, block));
+  const bad = results.filter(r => !r.ok);
+  return {
+    ok: bad.length === 0,
+    error: bad.length ? bad.map(r => r.error).join('；') : undefined,
+    results,
+    动作: results.every(r => r.动作 === '无需处理')
+      ? '无需处理'
+      : results.map(r => `${r.host}：${r.动作}`).join('，'),
+  };
 }
 
 /**
@@ -745,16 +817,13 @@ function cmdMigrate(cwd, argv) {
       done.push({ 件: '本地指针', 结果: '无需处理' });
     }
 
-    const res = readResident(cwd);
-    if (res.status === 'present' && res.version !== RESIDENT_VERSION) {
-      const r = rebuildResident(cwd);
-      done.push(r.ok ? { 件: '常驻件', 结果: r.动作, 路径: r.path } : { 件: '常驻件', 结果: '重建失败', 原因: r.error });
-    } else if (res.status === 'absent' && argv.includes('--write-resident')) {
-      const r = rebuildResident(cwd);
-      done.push(r.ok ? { 件: '常驻件', 结果: r.动作, 路径: r.path } : { 件: '常驻件', 结果: '写入失败', 原因: r.error });
-    } else {
-      done.push({ 件: '常驻件', 结果: res.status === 'present' ? '无需处理' : '未铺（要铺加 --write-resident）' });
-    }
+    // 常驻件：默认就铺，两个宿主都铺，不需要任何额外参数。
+    // 原先要加 --write-resident 才铺，而那个参数 help 里没列、任何主手册也没提——
+    // 等于这一件永远不会发生。纯本机动作、区外一字不动，没有理由设门槛。
+    const r = rebuildResident(cwd);
+    done.push(r.ok
+      ? { 件: '常驻件', 结果: r.动作, 路径: r.results.map(x => x.path) }
+      : { 件: '常驻件', 结果: '写入失败', 原因: r.error });
   }
 
   // 项目档案：先试运行吐清单，人放行（--apply）后才执行
@@ -960,7 +1029,7 @@ function usage() {
     '  tingle doctor                这台电脑装齐了没有',
     '  tingle resolve               这个项目在这台电脑上能不能直接开工',
     '  tingle refresh               把项目档案与总索引拉一份到本机缓存',
-    '  tingle migrate               本机两件照模板重建（本地指针、常驻件）',
+    '  tingle migrate               本机两件照模板重建（本地指针、常驻件；常驻件两侧都铺）',
     '  tingle migrate --profile     项目档案 1→2，先试运行吐清单',
     '  tingle migrate --profile --apply   人放行后，吐出目标结构',
     '  tingle check <技能名>        这个技能这一次能不能跑',
