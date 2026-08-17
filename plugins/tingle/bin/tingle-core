@@ -1,0 +1,1014 @@
+#!/usr/bin/env node
+'use strict';
+
+/**
+ * tingle-core —— tingle 插件的确定性核心。
+ *
+ * 一句话职责：全部机械判定的唯一实现。跑一次吐几行结构化结果。
+ * 它自己不进模型上下文，进的只有它吐出来的那几行。
+ *
+ * 五条命令：
+ *   doctor            这台电脑装齐了没有
+ *   resolve           这个项目在这台电脑上能不能直接开工
+ *   refresh           把项目档案与项目总索引拉一份到本机缓存
+ *   migrate           把旧结构就地升级（本机两件 + 项目档案）
+ *   check <技能名>    这个技能这一次能不能跑
+ *
+ * 边界（2026-08-17 定）：
+ *   - 程序只判「在不在、打不打得开、版本对不对、登记齐不齐」这类机械事实。
+ *   - 声明里那些「合格条件」（就绪判据）程序一概不读——由 AI 在技能真正开跑时逐条判。
+ *   - 程序只判不修：一切重建、补齐、放行归 project-readiness 与 migrate。
+ */
+
+const fs = require('fs');
+const path = require('path');
+const os = require('os');
+const { execFileSync } = require('child_process');
+
+// ─────────────────────────────────────────────────────────────
+// 常量
+// ─────────────────────────────────────────────────────────────
+
+const STATE_VERSION = 2;      // 本地指针 .tingle/state.json 的结构版本
+const PROFILE_VERSION = 2;    // 项目档案的结构版本
+const RESIDENT_VERSION = 1;   // 常驻件模版的结构版本
+
+const STATE_REL = path.join('.tingle', 'state.json');
+const CACHE_DIR_REL = path.join('.tingle', 'cache');
+const CACHE_PROFILE_REL = path.join(CACHE_DIR_REL, '项目档案.json');
+const CACHE_INDEX_REL = path.join(CACHE_DIR_REL, '项目索引.md');
+
+const PROFILE_TITLE = 'tingle-项目档案';
+const INDEX_TITLE = 'tingle-项目索引';
+const ARCHIVE_FOLDER = '_tingle';
+
+const RESIDENT_BEGIN = '<!-- tingle:常驻件 开始 -->';
+const RESIDENT_END = '<!-- tingle:常驻件 结束 -->';
+const RESIDENT_VERSION_RE = /<!--\s*tingle:常驻件-version\s+(\d+)\s*-->/;
+const RESIDENT_HOSTS = ['CLAUDE.md', 'AGENTS.md'];
+
+const CACHE_STALE_LINE =
+  '本缓存已失效：本次会话未能从云盘拉取。请直接读云盘，不要使用任何旧副本。';
+
+// resolve 的五种结论。第五种「配置不完整」由 Ryan 2026-08-17 拍板新增：
+// 原本只有四种，装不下「文件在、格式也对，但某一栏是空的」这种情况。
+const VERDICT = {
+  OK: '正常',
+  NO_STATE: '本机未配置',
+  INCOMPLETE: '配置不完整',
+  STALE: '结构旧',
+  UNREACHABLE: '打不开',
+};
+
+// 三种资源类型，及各自在项目档案里必须填的值字段
+const TYPE_VALUE_FIELDS = {
+  'lark-doc': ['link'],
+  'lark-base': ['base_token', 'table_id'],
+  'lark-drive': ['folder_token'],
+};
+
+// 声明块里标这一项「每次输入不一样」时，程序不去档案找它的地址、也不探活。
+// 由 Ryan 2026-08-17 拍板新增（原先输入只分「随项目变」「跨项目同一份」两类，
+// 装不下「每次跑都是另一份」的那类，比如这次要校对的那篇稿子）。
+const PER_RUN_KEY = '每次输入不一样';
+
+const PLUGIN_ROOT = path.resolve(__dirname, '..');
+
+// ─────────────────────────────────────────────────────────────
+// 基础工具
+// ─────────────────────────────────────────────────────────────
+
+function readFileSafe(p) {
+  try { return fs.readFileSync(p, 'utf8'); } catch (e) { return null; }
+}
+
+function existsSafe(p) {
+  try { fs.accessSync(p); return true; } catch (e) { return false; }
+}
+
+/** 跑一条 lark-cli 命令。永不抛异常，一律回结构化结果。 */
+function lark(args, opts = {}) {
+  const timeout = opts.timeout || 45000;
+  try {
+    const out = execFileSync('lark-cli', args, {
+      encoding: 'utf8',
+      timeout,
+      maxBuffer: 64 * 1024 * 1024,
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    return { ok: true, stdout: out };
+  } catch (e) {
+    const stderr = e.stderr ? String(e.stderr) : '';
+    const stdout = e.stdout ? String(e.stdout) : '';
+    return {
+      ok: false,
+      stdout,
+      stderr,
+      code: typeof e.status === 'number' ? e.status : null,
+      message: e.message || '',
+    };
+  }
+}
+
+/**
+ * 跑一条 lark-cli 命令并把输出当 JSON 解析。
+ * lark-cli 出错时同样吐结构化 JSON（含 error.code / error.message），
+ * 所以失败路径也先试着解析——拿到的错误码要带进 resolve 的「打不开」结论里。
+ */
+function larkJson(args, opts = {}) {
+  const r = lark(args, opts);
+  const text = (r.stdout && r.stdout.trim()) ? r.stdout : (r.stderr || '');
+  let parsed = null;
+  try { parsed = JSON.parse(text); } catch (e) { /* 不是 JSON，走下面的兜底 */ }
+
+  if (parsed && parsed.ok === false) {
+    const err = parsed.error || {};
+    return {
+      ok: false,
+      error: err.message ? String(err.message) : 'lark-cli 报错但没给消息',
+      code: err.code !== undefined ? err.code : null,
+    };
+  }
+  if (!r.ok) {
+    const brief = (r.stderr || r.message || '').trim().split('\n')[0] || '命令执行失败';
+    return { ok: false, error: brief.slice(0, 300), code: r.code };
+  }
+  if (!parsed) {
+    return { ok: false, error: 'lark-cli 返回的不是合法 JSON', code: null };
+  }
+  return { ok: true, data: parsed };
+}
+
+/** 从一段 markdown 里抠出第一个 ```json 代码块并解析。 */
+function extractJsonBlock(md) {
+  if (typeof md !== 'string') return { ok: false, error: '内容不是文本' };
+  const m = md.match(/```json\s*\r?\n([\s\S]*?)\r?\n```/);
+  if (!m) return { ok: false, error: '正文里没有 json 代码块' };
+  try {
+    return { ok: true, value: JSON.parse(m[1]), raw: m[1] };
+  } catch (e) {
+    return { ok: false, error: 'json 代码块解析失败：' + e.message };
+  }
+}
+
+function isNonEmpty(v) {
+  return typeof v === 'string' ? v.trim().length > 0 : v !== undefined && v !== null;
+}
+
+function dig(obj, ...keys) {
+  let cur = obj;
+  for (const k of keys) {
+    if (cur === null || typeof cur !== 'object') return undefined;
+    cur = cur[k];
+  }
+  return cur;
+}
+
+// ─────────────────────────────────────────────────────────────
+// 输出
+// ─────────────────────────────────────────────────────────────
+
+let WANT_JSON = false;
+
+function emit(payload, humanLines) {
+  if (WANT_JSON) {
+    process.stdout.write(JSON.stringify(payload, null, 2) + '\n');
+  } else {
+    process.stdout.write(humanLines.filter(l => l !== null && l !== undefined).join('\n') + '\n');
+  }
+}
+
+function bullet(list) {
+  return list.map(s => '  - ' + s);
+}
+
+// ─────────────────────────────────────────────────────────────
+// 读本机三样：本地指针 / 常驻件 / 插件自身
+// ─────────────────────────────────────────────────────────────
+
+/**
+ * 读本地指针。回四种态之一：
+ *   missing      文件不在        → resolve 判「本机未配置」
+ *   unparsable   文件在、解析不了 → resolve 判「配置不完整」（本机件，重建即可）
+ *   incomplete   三字段有缺或为空 → resolve 判「配置不完整」
+ *   ok           齐了（版本另判）
+ */
+function readState(cwd) {
+  const p = path.join(cwd, STATE_REL);
+  if (!existsSafe(p)) return { status: 'missing', path: p };
+  const raw = readFileSafe(p);
+  if (raw === null) return { status: 'unparsable', path: p, reason: '文件读不出来' };
+  let v;
+  try { v = JSON.parse(raw); } catch (e) {
+    return { status: 'unparsable', path: p, reason: 'JSON 解析失败：' + e.message };
+  }
+  const missing = [];
+  if (!isNonEmpty(v.tingle_state_version) && v.tingle_state_version !== 0) missing.push('tingle_state_version');
+  if (!isNonEmpty(v.profile_link)) missing.push('profile_link');
+  if (!isNonEmpty(v.initialized_at)) missing.push('initialized_at');
+  if (missing.length) return { status: 'incomplete', path: p, value: v, missing };
+  return { status: 'ok', path: p, value: v };
+}
+
+/** 找本机常驻件所在的宿主文件（CLAUDE.md / AGENTS.md），读出它的版本。 */
+function readResident(cwd) {
+  for (const host of RESIDENT_HOSTS) {
+    const p = path.join(cwd, host);
+    const raw = readFileSafe(p);
+    if (raw === null) continue;
+    const b = raw.indexOf(RESIDENT_BEGIN);
+    const e = raw.indexOf(RESIDENT_END);
+    if (b === -1 || e === -1 || e < b) continue;
+    const region = raw.slice(b, e + RESIDENT_END.length);
+    const m = region.match(RESIDENT_VERSION_RE);
+    return {
+      status: 'present',
+      path: p,
+      host,
+      version: m ? parseInt(m[1], 10) : null,
+      region,
+      raw,
+      begin: b,
+      end: e + RESIDENT_END.length,
+    };
+  }
+  return { status: 'absent' };
+}
+
+function residentTemplatePath() {
+  return path.join(PLUGIN_ROOT, 'templates', '常驻件模版');
+}
+
+// ─────────────────────────────────────────────────────────────
+// 读飞书：项目档案 / 云盘文件夹 / 探活
+// ─────────────────────────────────────────────────────────────
+
+/** 打开项目档案，读出正文里的 JSON。 */
+function fetchProfile(link) {
+  const r = larkJson(['docs', '+fetch', '--doc', link, '--doc-format', 'markdown', '--json']);
+  if (!r.ok) return { ok: false, error: r.error || '档案打不开', code: r.code };
+  const content = dig(r.data, 'data', 'document', 'content');
+  if (typeof content !== 'string') {
+    return { ok: false, error: '档案返回里没有正文内容' };
+  }
+  const j = extractJsonBlock(content);
+  if (!j.ok) return { ok: false, error: j.error };
+  return {
+    ok: true,
+    profile: j.value,
+    content,
+    revision: dig(r.data, 'data', 'document', 'revision_id'),
+    documentId: dig(r.data, 'data', 'document', 'document_id'),
+  };
+}
+
+/** 列一个云盘文件夹。用于探活，也用于找项目总索引。 */
+function listFolder(folderToken) {
+  const r = larkJson([
+    'drive', 'files', 'list',
+    '--params', JSON.stringify({ folder_token: folderToken, page_size: 200 }),
+    '--json',
+  ]);
+  if (!r.ok) return { ok: false, error: r.error || '文件夹列不出来' };
+  let files = dig(r.data, 'data', 'files');
+  if (!Array.isArray(files)) files = dig(r.data, 'data', 'data', 'files');
+  if (!Array.isArray(files)) files = [];
+  return { ok: true, files };
+}
+
+/**
+ * 探活一个地址：按类型轻访问一次，确证它活着、本人打得开。
+ * 只判「打不打得开」，不读内容、不验任何合格条件。
+ */
+function probe(type, cfg) {
+  if (type === 'lark-doc') {
+    const r = larkJson(['drive', '+inspect', '--url', cfg.link, '--json']);
+    if (!r.ok) return { ok: false, error: r.error || '文档打不开' };
+    return { ok: true, title: dig(r.data, 'data', 'title') };
+  }
+  if (type === 'lark-base') {
+    const r = larkJson([
+      'base', '+base-get',
+      '--app-token', cfg.base_token,
+      '--json',
+    ]);
+    if (!r.ok) return { ok: false, error: r.error || '多维表格打不开' };
+    return { ok: true, title: dig(r.data, 'data', 'app', 'name') };
+  }
+  if (type === 'lark-drive') {
+    const r = listFolder(cfg.folder_token);
+    if (!r.ok) return { ok: false, error: r.error };
+    return { ok: true, count: r.files.length };
+  }
+  return { ok: false, error: '认不出的类型：' + type };
+}
+
+// ─────────────────────────────────────────────────────────────
+// 项目档案的字段校验
+// ─────────────────────────────────────────────────────────────
+
+/** 项目字段齐不齐（不含版本号，版本号另判）。 */
+function checkProfileFields(profile) {
+  const missing = [];
+  const need = [
+    ['project', 'id'],
+    ['project', 'name'],
+    ['project', 'tags', '品类', '业务线'],
+    ['project', 'tags', '品类', '合规类目'],
+    ['project', 'tags', '品类', '产品品类'],
+    ['project', 'tags', '品牌'],
+    ['project', '阶段'],
+    ['folder_token'],
+  ];
+  for (const p of need) {
+    if (!isNonEmpty(dig(profile, ...p))) missing.push(p.join('.'));
+  }
+  if (!('initialized_at' in (profile || {}))) missing.push('initialized_at');
+  return missing;
+}
+
+// ─────────────────────────────────────────────────────────────
+// 命令：doctor
+// ─────────────────────────────────────────────────────────────
+
+function cmdDoctor() {
+  const lacks = [];
+  const notes = [];
+
+  // 一、飞书命令行工具在不在
+  const ver = lark(['--version'], { timeout: 15000 });
+  const larkCliOk = ver.ok;
+  if (!larkCliOk) {
+    lacks.push({
+      项: '飞书命令行工具',
+      缺什么: 'lark-cli 没装或不在 PATH 上',
+      怎么补: 'npx skills add larksuite/cli -g',
+    });
+  }
+
+  // 二、配套技能目录在不在
+  const skillHomes = [
+    path.join(os.homedir(), '.claude', 'skills'),
+    path.join(os.homedir(), '.agents', 'skills'),
+  ];
+  let larkSkills = false;
+  for (const home of skillHomes) {
+    try {
+      if (fs.readdirSync(home).some(n => n.startsWith('lark-'))) { larkSkills = true; break; }
+    } catch (e) { /* 目录不在，继续看下一个 */ }
+  }
+  if (!larkSkills) {
+    lacks.push({
+      项: '飞书配套技能目录',
+      缺什么: '~/.claude/skills 或 ~/.agents/skills 下没有 lark-* 目录',
+      怎么补: 'npx skills add larksuite/cli -g',
+    });
+  }
+
+  // 三、授权：只认使用者本人身份，三态判定
+  if (larkCliOk) {
+    const auth = larkJson(['auth', 'status', '--json'], { timeout: 20000 });
+    if (!auth.ok) {
+      lacks.push({ 项: '飞书授权', 缺什么: '查不到授权状态：' + (auth.error || ''), 怎么补: 'lark-cli auth login' });
+    } else {
+      const user = dig(auth.data, 'identities', 'user') || dig(auth.data, 'data', 'identities', 'user');
+      if (!user || user.available === false) {
+        lacks.push({ 项: '飞书授权', 缺什么: '本人身份不在场（只认本人身份，应用身份不算）', 怎么补: 'lark-cli auth login' });
+      } else {
+        const st = String(user.tokenStatus || '');
+        if (st === 'valid') {
+          notes.push('飞书授权有效（本人身份）');
+        } else {
+          // 已过期但可能自动续：跑一条只读命令触发续期，续上即算过。
+          const retry = larkJson(['auth', 'status', '--json'], { timeout: 20000 });
+          const u2 = retry.ok
+            ? (dig(retry.data, 'identities', 'user') || dig(retry.data, 'data', 'identities', 'user'))
+            : null;
+          if (u2 && String(u2.tokenStatus || '') === 'valid') {
+            notes.push('飞书授权已自动续期（本人身份）');
+          } else {
+            lacks.push({
+              项: '飞书授权',
+              缺什么: `本人身份的授权续不回来（当前状态：${st || '判不出'}）`,
+              怎么补: 'lark-cli auth login（需本人在浏览器完成）',
+            });
+          }
+        }
+      }
+    }
+  }
+
+  // 四、插件自身在不在
+  const pluginOk = existsSafe(path.join(PLUGIN_ROOT, 'skills')) && existsSafe(path.join(PLUGIN_ROOT, 'hooks'));
+  if (!pluginOk) {
+    lacks.push({ 项: 'tingle 插件', 缺什么: '插件目录不完整', 怎么补: '经插件市场重装 tingle' });
+  }
+
+  const payload = { 命令: 'doctor', 缺什么: lacks, 顺带查到的: notes };
+  if (lacks.length === 0) {
+    emit(payload, ['doctor：本机三样齐了。', ...bullet(notes)]);
+    return 0;
+  }
+  emit(payload, [
+    `doctor：缺 ${lacks.length} 样。`,
+    ...lacks.map(l => `  - ${l.项}：${l.缺什么}\n    补法：${l.怎么补}`),
+    ...bullet(notes),
+  ]);
+  return 1;
+}
+
+// ─────────────────────────────────────────────────────────────
+// 命令：resolve
+// ─────────────────────────────────────────────────────────────
+
+function resolveCore(cwd) {
+  // 第一层：本机指针
+  const st = readState(cwd);
+  if (st.status === 'missing') {
+    return { 结论: VERDICT.NO_STATE, 点名: '本地指针', 说明: `${STATE_REL} 不存在`, 修法: '走项目初始化（project-readiness）' };
+  }
+  if (st.status === 'unparsable') {
+    return { 结论: VERDICT.INCOMPLETE, 点名: '本地指针', 说明: st.reason, 修法: 'tingle migrate（照模板重建本地指针，纯本机动作）' };
+  }
+  if (st.status === 'incomplete') {
+    return {
+      结论: VERDICT.INCOMPLETE, 点名: '本地指针',
+      说明: '这几栏缺或为空：' + st.missing.join('、'),
+      修法: 'tingle migrate（照模板重建本地指针，纯本机动作）',
+    };
+  }
+  if (st.value.tingle_state_version !== STATE_VERSION) {
+    return {
+      结论: VERDICT.STALE, 点名: '本地指针',
+      说明: `结构版本 ${st.value.tingle_state_version}，当前应为 ${STATE_VERSION}`,
+      修法: 'tingle migrate（照模板重建本地指针，纯本机动作）',
+    };
+  }
+
+  // 第二层：项目档案
+  const pf = fetchProfile(st.value.profile_link);
+  if (!pf.ok) {
+    return {
+      结论: VERDICT.UNREACHABLE, 点名: '项目档案',
+      说明: pf.error, 错误码: pf.code === undefined ? null : pf.code,
+      档案链接: st.value.profile_link,
+      修法: '按错误性质处置：链接失效或没权限找项目资源管理者；网络问题重试',
+    };
+  }
+  const profile = pf.profile;
+  if (profile.tingle_profile_version !== PROFILE_VERSION) {
+    return {
+      结论: VERDICT.STALE, 点名: '项目档案',
+      说明: `结构版本 ${profile.tingle_profile_version}，当前应为 ${PROFILE_VERSION}`,
+      档案链接: st.value.profile_link,
+      修法: 'tingle migrate（试运行看清单 → 人放行 → 执行）',
+    };
+  }
+  const fieldMiss = checkProfileFields(profile);
+  if (fieldMiss.length) {
+    return {
+      结论: VERDICT.INCOMPLETE, 点名: '项目档案',
+      说明: '这几项缺或为空：' + fieldMiss.join('、'),
+      档案链接: st.value.profile_link,
+      修法: '回 project-readiness 补打标／补登记（写飞书先放行）',
+    };
+  }
+
+  // 第三层：项目总索引在不在
+  // ——这一查改造前只靠 AI 自己记得做，2026-08-17 拍板并进本命令，变成程序硬查。
+  const ls = listFolder(profile.folder_token);
+  if (!ls.ok) {
+    return {
+      结论: VERDICT.UNREACHABLE, 点名: '项目云盘',
+      说明: ls.error, 修法: '找项目资源管理者开云盘权限',
+    };
+  }
+  const hasIndex = ls.files.some(f => String(f.name || '').startsWith(INDEX_TITLE));
+  if (!hasIndex) {
+    return {
+      结论: VERDICT.INCOMPLETE, 点名: '项目总索引',
+      说明: `项目云盘顶层没有「${INDEX_TITLE}」——多半是忘了建`,
+      修法: 'tingle migrate（按现状建出总索引）',
+    };
+  }
+
+  // 第四层：常驻件（区在才判版本；不在不算错，属尚未铺开）
+  const res = readResident(cwd);
+  if (res.status === 'present' && res.version !== RESIDENT_VERSION) {
+    return {
+      结论: VERDICT.STALE, 点名: '常驻件',
+      说明: `结构版本 ${res.version === null ? '认不出' : res.version}，当前应为 ${RESIDENT_VERSION}`,
+      宿主文件: res.path,
+      修法: 'tingle migrate（照模版重建标记区，区外一字不动，纯本机动作）',
+    };
+  }
+
+  return {
+    结论: VERDICT.OK,
+    项目: { id: dig(profile, 'project', 'id'), name: dig(profile, 'project', 'name') },
+    档案链接: st.value.profile_link,
+    项目云盘: profile.folder_token,
+    常驻件: res.status === 'present' ? `在（${res.host}）` : '未铺',
+    // 下面两项供 check 复用，免得同一份档案拉两遍；不进人读输出。
+    _profile: profile,
+    _state: st.value,
+  };
+}
+
+/** 把 resolveCore 的内部字段摘掉再往外吐。 */
+function publicVerdict(r) {
+  const out = {};
+  for (const [k, v] of Object.entries(r)) if (!k.startsWith('_')) out[k] = v;
+  return out;
+}
+
+function cmdResolve(cwd) {
+  const r = resolveCore(cwd);
+  const lines = [`resolve：${r.结论}`];
+  if (r.点名) lines.push(`  哪一份：${r.点名}`);
+  if (r.说明) lines.push(`  说明：${r.说明}`);
+  if (r.错误码 !== undefined && r.错误码 !== null) lines.push(`  错误码：${r.错误码}`);
+  if (r.项目) lines.push(`  项目：${r.项目.name || ''}（${r.项目.id || ''}）`);
+  if (r.档案链接) lines.push(`  档案：${r.档案链接}`);
+  if (r.项目云盘) lines.push(`  云盘：${r.项目云盘}`);
+  if (r.常驻件) lines.push(`  常驻件：${r.常驻件}`);
+  if (r.修法) lines.push(`  修法：${r.修法}`);
+  emit(Object.assign({ 命令: 'resolve' }, publicVerdict(r)), lines);
+  return r.结论 === VERDICT.OK ? 0 : 1;
+}
+
+// ─────────────────────────────────────────────────────────────
+// 命令：refresh
+// ─────────────────────────────────────────────────────────────
+
+function clearCacheFiles(cwd) {
+  // 拉不到时：那两个文件若在，清空、各只留一行失效说明；不在就什么都不做。
+  let cleared = 0;
+  for (const rel of [CACHE_PROFILE_REL, CACHE_INDEX_REL]) {
+    const p = path.join(cwd, rel);
+    if (existsSafe(p)) {
+      try { fs.writeFileSync(p, CACHE_STALE_LINE + '\n', 'utf8'); cleared++; } catch (e) { /* 尽力而为 */ }
+    }
+  }
+  return cleared;
+}
+
+function cmdRefresh(cwd) {
+  const st = readState(cwd);
+  if (st.status !== 'ok') {
+    // 锚不在或不完整时整段跳过：不创建缓存目录、不留空壳文件。
+    emit({ 命令: 'refresh', 结果: '跳过', 原因: '本地指针不可用（' + st.status + '）' },
+      ['refresh：跳过（本地指针不可用，不建缓存）']);
+    return 0;
+  }
+
+  const pf = fetchProfile(st.value.profile_link);
+  if (!pf.ok) {
+    const n = clearCacheFiles(cwd);
+    emit({ 命令: 'refresh', 结果: '拉不到', 原因: pf.error, 已清空: n },
+      [`refresh：没拉到（${pf.error}）。已清空 ${n} 份旧副本，照常开工。`]);
+    return 0; // 不挡开工
+  }
+
+  try { fs.mkdirSync(path.join(cwd, CACHE_DIR_REL), { recursive: true }); } catch (e) { /* ignore */ }
+  let wrote = 0;
+  try {
+    fs.writeFileSync(path.join(cwd, CACHE_PROFILE_REL), JSON.stringify(pf.profile, null, 2) + '\n', 'utf8');
+    wrote++;
+  } catch (e) { /* ignore */ }
+
+  // 第二件：顺档案顶层的云盘地址找总索引
+  let indexOk = false;
+  const ft = pf.profile.folder_token;
+  if (isNonEmpty(ft)) {
+    const ls = listFolder(ft);
+    if (ls.ok) {
+      const hit = ls.files.find(f => String(f.name || '').startsWith(INDEX_TITLE));
+      if (hit && hit.url) {
+        const doc = larkJson(['docs', '+fetch', '--doc', hit.url, '--doc-format', 'markdown', '--json']);
+        const content = doc.ok ? dig(doc.data, 'data', 'document', 'content') : null;
+        if (typeof content === 'string') {
+          try {
+            fs.writeFileSync(path.join(cwd, CACHE_INDEX_REL), content + '\n', 'utf8');
+            wrote++; indexOk = true;
+          } catch (e) { /* ignore */ }
+        }
+      }
+    }
+  }
+  if (!indexOk) {
+    const p = path.join(cwd, CACHE_INDEX_REL);
+    if (existsSafe(p)) { try { fs.writeFileSync(p, CACHE_STALE_LINE + '\n', 'utf8'); } catch (e) { /* ignore */ } }
+  }
+
+  emit({ 命令: 'refresh', 结果: '已刷新', 写入份数: wrote, 总索引: indexOk ? '拉到' : '没拉到' },
+    [`refresh：写入 ${wrote} 份（档案 ✓ / 总索引 ${indexOk ? '✓' : '×'}）`]);
+  return 0;
+}
+
+// ─────────────────────────────────────────────────────────────
+// 命令：migrate
+// ─────────────────────────────────────────────────────────────
+
+/** 本机件之一：照模板重建本地指针。纯本机动作，无须放行。 */
+function rebuildState(cwd, keepLink) {
+  const p = path.join(cwd, STATE_REL);
+  const old = readState(cwd);
+  const link = keepLink
+    || (old.value && isNonEmpty(old.value.profile_link) ? old.value.profile_link : null);
+  if (!link) {
+    return { ok: false, error: '重建不了：拿不到项目档案链接（旧指针里没有，也没从命令行给）。请用 --profile-link <链接> 再跑一次。' };
+  }
+  const initialized = (old.value && isNonEmpty(old.value.initialized_at))
+    ? old.value.initialized_at
+    : new Date().toISOString().slice(0, 10);
+  const next = {
+    tingle_state_version: STATE_VERSION,
+    profile_link: link,
+    initialized_at: initialized,
+  };
+  if (existsSafe(p)) {
+    try { fs.copyFileSync(p, p + '.bak-' + Date.now()); } catch (e) { /* 尽力而为 */ }
+  }
+  fs.mkdirSync(path.dirname(p), { recursive: true });
+  fs.writeFileSync(p, JSON.stringify(next, null, 2) + '\n', 'utf8');
+  return { ok: true, path: p, value: next };
+}
+
+/** 本机件之二：照模版重建常驻件标记区。区外一字不动，覆盖前存档。 */
+function rebuildResident(cwd) {
+  const tpl = readFileSafe(residentTemplatePath());
+  if (tpl === null) return { ok: false, error: '插件仓里没有常驻件模版' };
+  const res = readResident(cwd);
+  const host = res.status === 'present' ? res.path : path.join(cwd, RESIDENT_HOSTS[0]);
+  const block = RESIDENT_BEGIN + '\n' + tpl.trim() + '\n' + RESIDENT_END;
+
+  if (res.status === 'present') {
+    // 区内被人改过就是信号：留一份 diff 给人看，说明这里该判层。
+    const oldRegion = res.region;
+    try { fs.copyFileSync(res.path, res.path + '.bak-' + Date.now()); } catch (e) { /* ignore */ }
+    const next = res.raw.slice(0, res.begin) + block + res.raw.slice(res.end);
+    fs.writeFileSync(res.path, next, 'utf8');
+    return { ok: true, path: res.path, 动作: '重建标记区', 区内原文长度: oldRegion.length };
+  }
+
+  const raw = readFileSafe(host);
+  const next = (raw === null ? '' : raw.replace(/\s*$/, '\n\n')) + block + '\n';
+  fs.writeFileSync(host, next, 'utf8');
+  return { ok: true, path: host, 动作: '首次写入标记区' };
+}
+
+/**
+ * 项目档案 1 → 2。列出「将改什么」，人放行后才执行。
+ * 2026-08-17 拍板：升级时顺手删掉 skills.context-distill.项目云盘
+ * ——它跟顶层 folder_token 记的是同一件事，两处可读就是两个维护点。
+ * 撤除放在这一步做，v1 的取值路径全程没断过（顶层字段正是从它取的值）。
+ */
+function planProfileMigration(profile) {
+  const changes = [];
+  const warnings = [];
+
+  if (profile.tingle_profile_version === PROFILE_VERSION) {
+    return { ok: false, error: '这份档案已经是版本 ' + PROFILE_VERSION + '，不必升级' };
+  }
+  if (profile.tingle_profile_version !== 1) {
+    return {
+      ok: false,
+      error: `读到的档案版本是 ${profile.tingle_profile_version}，本升级只覆盖 1 → 2。停，交人判断。`,
+    };
+  }
+
+  const next = JSON.parse(JSON.stringify(profile));
+  next.tingle_profile_version = PROFILE_VERSION;
+  changes.push(`版本号 1 → ${PROFILE_VERSION}`);
+
+  // 第 0 步：取项目云盘坐标。版本 1 的档案顶层没有它，值记在蒸馏技能名下。
+  let folderToken = profile.folder_token;
+  const legacy = dig(profile, 'skills', 'context-distill', '项目云盘', 'folder_token');
+  if (!isNonEmpty(folderToken)) {
+    if (!isNonEmpty(legacy)) {
+      return {
+        ok: false,
+        error: '取不到项目云盘地址：顶层没有 folder_token，skills.context-distill.项目云盘 也没有。停，向使用者问明本项目云盘顶层文件夹是哪一个。',
+      };
+    }
+    folderToken = legacy;
+    changes.push(`顶层新增 folder_token = ${folderToken}（从 skills.context-distill.项目云盘 取得）`);
+  }
+  next.folder_token = folderToken;
+
+  // 各技能名下的输入整体缩进一层包进 inputs（键名与值一字不改，只改层级）
+  if (next.skills && typeof next.skills === 'object') {
+    for (const [skillName, block] of Object.entries(next.skills)) {
+      if (!block || typeof block !== 'object') continue;
+      if (block.inputs || block.outputs) continue; // 已经是新形状
+      const inputs = {};
+      for (const [k, v] of Object.entries(block)) inputs[k] = v;
+      next.skills[skillName] = { inputs };
+      const names = Object.keys(inputs);
+      if (names.length) changes.push(`skills.${skillName} 下 ${names.length} 项输入缩进进 inputs：${names.join('、')}`);
+    }
+  }
+
+  // 顺手撤掉重复记着云盘根的那一项
+  if (dig(next, 'skills', 'context-distill', 'inputs', '项目云盘')) {
+    delete next.skills['context-distill'].inputs['项目云盘'];
+    changes.push('删掉 skills.context-distill.inputs.项目云盘（与顶层 folder_token 记的是同一件事）');
+    if (Object.keys(next.skills['context-distill'].inputs).length === 0) {
+      warnings.push('删完之后蒸馏技能名下没有声明输入了——这是预期的，它读的原料与模板不走档案登记。');
+    }
+  }
+
+  // 迁移不发明落点
+  changes.push('不写 outputs（迁移不发明落点；日后哪个技能真要写入时再补登记）');
+
+  return { ok: true, next, changes, warnings, folderToken };
+}
+
+function cmdMigrate(cwd, argv) {
+  const wantLocal = argv.includes('--local') || (!argv.includes('--profile'));
+  const wantProfile = argv.includes('--profile');
+  const apply = argv.includes('--apply');
+  const linkIdx = argv.indexOf('--profile-link');
+  const givenLink = linkIdx !== -1 ? argv[linkIdx + 1] : null;
+
+  const done = [];
+
+  // 本机两件：无须放行，直接做
+  if (wantLocal) {
+    const st = readState(cwd);
+    const needStateRebuild = st.status !== 'ok' || st.value.tingle_state_version !== STATE_VERSION;
+    if (needStateRebuild) {
+      const r = rebuildState(cwd, givenLink);
+      done.push(r.ok ? { 件: '本地指针', 结果: '已重建', 路径: r.path } : { 件: '本地指针', 结果: '重建失败', 原因: r.error });
+    } else {
+      done.push({ 件: '本地指针', 结果: '无需处理' });
+    }
+
+    const res = readResident(cwd);
+    if (res.status === 'present' && res.version !== RESIDENT_VERSION) {
+      const r = rebuildResident(cwd);
+      done.push(r.ok ? { 件: '常驻件', 结果: r.动作, 路径: r.path } : { 件: '常驻件', 结果: '重建失败', 原因: r.error });
+    } else if (res.status === 'absent' && argv.includes('--write-resident')) {
+      const r = rebuildResident(cwd);
+      done.push(r.ok ? { 件: '常驻件', 结果: r.动作, 路径: r.path } : { 件: '常驻件', 结果: '写入失败', 原因: r.error });
+    } else {
+      done.push({ 件: '常驻件', 结果: res.status === 'present' ? '无需处理' : '未铺（要铺加 --write-resident）' });
+    }
+  }
+
+  // 项目档案：先试运行吐清单，人放行（--apply）后才执行
+  if (wantProfile) {
+    const st = readState(cwd);
+    const link = givenLink || (st.value && st.value.profile_link);
+    if (!isNonEmpty(link)) {
+      emit({ 命令: 'migrate', 结果: '停', 原因: '拿不到项目档案链接' },
+        ['migrate：停——拿不到项目档案链接。用 --profile-link <链接> 指定。']);
+      return 1;
+    }
+    const pf = fetchProfile(link);
+    if (!pf.ok) {
+      emit({ 命令: 'migrate', 结果: '停', 原因: pf.error }, ['migrate：停——' + pf.error]);
+      return 1;
+    }
+    const plan = planProfileMigration(pf.profile);
+    if (!plan.ok) {
+      emit({ 命令: 'migrate', 结果: '停', 原因: plan.error }, ['migrate：停——' + plan.error]);
+      return 1;
+    }
+    if (!apply) {
+      emit(
+        { 命令: 'migrate', 模式: '试运行', 档案: link, 将改什么: plan.changes, 提醒: plan.warnings },
+        [
+          'migrate（试运行，什么都没改）：档案 1 → 2 将做这几件事——',
+          ...bullet(plan.changes),
+          ...(plan.warnings.length ? ['  提醒：', ...bullet(plan.warnings)] : []),
+          '',
+          '这是写飞书的动作。人放行后加 --apply 再跑一次。',
+        ]
+      );
+      return 0;
+    }
+    // 真执行归 project-readiness 走放行流程后调用；本命令只负责给出目标 JSON。
+    emit(
+      { 命令: 'migrate', 模式: '已放行', 档案: link, 将改什么: plan.changes, 目标JSON: plan.next },
+      [
+        'migrate：已放行，目标结构如下（写回动作由 project-readiness 执行：先存档旧版到 _tingle/，再原处覆盖，链接位置标题全不变，写完回读核对）。',
+        JSON.stringify(plan.next, null, 2),
+      ]
+    );
+    return 0;
+  }
+
+  emit({ 命令: 'migrate', 处理: done }, ['migrate：', ...done.map(d => `  - ${d.件}：${d.结果}${d.原因 ? '（' + d.原因 + '）' : ''}`)]);
+  return done.some(d => String(d.结果).includes('失败')) ? 1 : 0;
+}
+
+// ─────────────────────────────────────────────────────────────
+// 命令：check <技能名>
+// ─────────────────────────────────────────────────────────────
+
+function readSkillRequirements(skillName) {
+  const p = path.join(PLUGIN_ROOT, 'skills', skillName, 'SKILL.md');
+  const raw = readFileSafe(p);
+  if (raw === null) return { ok: false, error: `找不到技能 ${skillName}（${p} 不存在）` };
+  // 声明块是 SKILL.md 里第一个含 "requirements" 的 json 代码块
+  const blocks = [...raw.matchAll(/```json\s*\r?\n([\s\S]*?)\r?\n```/g)];
+  for (const b of blocks) {
+    if (!b[1].includes('"requirements"')) continue;
+    try {
+      const v = JSON.parse(b[1]);
+      if (v && v.requirements) return { ok: true, requirements: v.requirements, path: p };
+    } catch (e) { /* 试下一块 */ }
+  }
+  return { ok: true, requirements: { inputs: {}, outputs: {} }, path: p, note: '这个技能没有声明块，按「无输入、无落点」处理' };
+}
+
+function cmdCheck(cwd, skillName) {
+  if (!skillName) {
+    emit({ 命令: 'check', 结果: '停', 原因: '没给技能名' }, ['check：要给技能名。用法 tingle check <技能名>']);
+    return 2;
+  }
+
+  // 一读：技能的声明块
+  const req = readSkillRequirements(skillName);
+  if (!req.ok) {
+    emit({ 命令: 'check', 技能: skillName, 结果: '停', 原因: req.error }, ['check：停——' + req.error]);
+    return 2;
+  }
+  const declaredInputs = req.requirements.inputs || {};
+  const declaredOutputs = req.requirements.outputs || {};
+
+  // 二读：本地指针，连同项目档案的一整套前置判定。
+  // 走的就是 resolve 那一份实现——判定逻辑全家只有一份，check 不另写一套。
+  // 这一步不过就不必往下看登记了：档案版本不对时，登记的形状本来就是另一种，
+  // 拿新形状去找旧结构只会报出方向不对的卡点。
+  const r0 = resolveCore(cwd);
+  if (r0.结论 !== VERDICT.OK) {
+    emit(
+      { 命令: 'check', 技能: skillName, 结果: '卡点单', 卡在: '项目还没就绪', resolve结论: publicVerdict(r0) },
+      [
+        `check ${skillName}：卡点单——项目还没就绪，本次不跑。`,
+        `  resolve 说：${r0.结论}${r0.点名 ? '（' + r0.点名 + '）' : ''}`,
+        r0.说明 ? `  说明：${r0.说明}` : null,
+        `  修法：${r0.修法 || '走 project-readiness'}`,
+      ]
+    );
+    return 1;
+  }
+  const profile = r0._profile;
+  const st = { value: r0._state };
+
+  const 开工单 = [];
+  const 卡点 = [];
+  const 运行时提供 = [];
+
+  const reg = dig(profile, 'skills', skillName) || {};
+  const regInputs = reg.inputs || {};
+  const regOutputs = reg.outputs || {};
+
+  // 三读：拿声明去档案对登记
+  for (const [name, decl] of Object.entries(declaredInputs)) {
+    // 「每次输入不一样」的那类：不进档案、不探活，只在开工单上记一行提醒。
+    if (decl && decl[PER_RUN_KEY]) {
+      运行时提供.push({ 输入: name, 说明: '每次输入不一样，由调用时当场给出' });
+      continue;
+    }
+    const cfg = regInputs[name];
+    if (!cfg) {
+      卡点.push({ 缺什么: `输入「${name}」在项目档案里没有登记`, 谁能生产: (decl && decl.produced_by) || '—' });
+      continue;
+    }
+    const type = cfg.type || (decl && decl.type);
+    const need = TYPE_VALUE_FIELDS[type];
+    if (!need) {
+      卡点.push({ 缺什么: `输入「${name}」的类型认不出（${type}）`, 谁能生产: (decl && decl.produced_by) || '—' });
+      continue;
+    }
+    const lackField = need.filter(f => !isNonEmpty(cfg[f]));
+    if (lackField.length) {
+      卡点.push({ 缺什么: `输入「${name}」登记不全，缺：${lackField.join('、')}`, 谁能生产: (decl && decl.produced_by) || '—' });
+      continue;
+    }
+    // 四读：地址探活。只判打不打得开，不读内容、不验合格条件。
+    const pr = probe(type, cfg);
+    if (!pr.ok) {
+      卡点.push({ 缺什么: `输入「${name}」地址打不开：${pr.error}`, 谁能生产: (decl && decl.produced_by) || '—' });
+      continue;
+    }
+    开工单.push({ 输入: name, 类型: type, 地址: cfg.link || cfg.base_token || cfg.folder_token, 探活: '通' });
+  }
+
+  // 落点只核登记，不探活（它可能到写入时才创建，写不进去会当场报错、不会无声）
+  for (const [name, decl] of Object.entries(declaredOutputs)) {
+    const cfg = regOutputs[name];
+    if (!cfg) {
+      卡点.push({ 缺什么: `落点「${name}」在项目档案里没有登记`, 谁能生产: '—（落点由人在放行清单里给地址）' });
+      continue;
+    }
+    const type = cfg.type || (decl && decl.type);
+    const need = TYPE_VALUE_FIELDS[type];
+    if (!need) {
+      卡点.push({ 缺什么: `落点「${name}」的类型认不出（${type}）`, 谁能生产: '—' });
+      continue;
+    }
+    const lackField = need.filter(f => !isNonEmpty(cfg[f]));
+    if (lackField.length) {
+      卡点.push({ 缺什么: `落点「${name}」登记不全，缺：${lackField.join('、')}`, 谁能生产: '—' });
+      continue;
+    }
+    开工单.push({ 落点: name, 类型: type, 地址: cfg.link || cfg.base_token || cfg.folder_token });
+  }
+
+  if (卡点.length) {
+    emit(
+      { 命令: 'check', 技能: skillName, 结果: '卡点单', 卡点, 已通过: 开工单, 运行时提供 },
+      [
+        `check ${skillName}：卡点单（${卡点.length} 处）`,
+        ...卡点.map(c => `  - ${c.缺什么}\n    谁能生产：${c.谁能生产}`),
+        '',
+        '本次不跑。修完重跑本命令复验。',
+      ]
+    );
+    return 1;
+  }
+
+  emit(
+    { 命令: 'check', 技能: skillName, 结果: '开工单', 开工单, 运行时提供 },
+    [
+      `check ${skillName}：开工单（${开工单.length} 项都通了）`,
+      ...开工单.map(o => `  - ${o.输入 ? '读' : '写'} ${o.输入 || o.落点}（${o.类型}）：${o.地址}`),
+      ...(运行时提供.length
+        ? ['', '  这几样每次输入不一样，由调用时当场给出：', ...bullet(运行时提供.map(r => r.输入))]
+        : []),
+      '',
+      '声明里那些合格条件程序不验——开跑时你自己逐条对照判。',
+    ]
+  );
+  return 0;
+}
+
+// ─────────────────────────────────────────────────────────────
+// 入口
+// ─────────────────────────────────────────────────────────────
+
+function usage() {
+  process.stdout.write([
+    'tingle-core —— tingle 插件的确定性核心',
+    '',
+    '用法：',
+    '  tingle doctor                这台电脑装齐了没有',
+    '  tingle resolve               这个项目在这台电脑上能不能直接开工',
+    '  tingle refresh               把项目档案与总索引拉一份到本机缓存',
+    '  tingle migrate               本机两件照模板重建（本地指针、常驻件）',
+    '  tingle migrate --profile     项目档案 1→2，先试运行吐清单',
+    '  tingle migrate --profile --apply   人放行后，吐出目标结构',
+    '  tingle check <技能名>        这个技能这一次能不能跑',
+    '',
+    '通用参数：',
+    '  --json           吐 JSON 而不是人读格式',
+    '  --cwd <路径>     指定项目工作文件夹（默认当前目录）',
+    '',
+  ].join('\n') + '\n');
+}
+
+function main() {
+  const argv = process.argv.slice(2);
+  WANT_JSON = argv.includes('--json');
+
+  const cwdIdx = argv.indexOf('--cwd');
+  const cwd = cwdIdx !== -1 ? path.resolve(argv[cwdIdx + 1]) : process.cwd();
+
+  const cmd = argv.find(a => !a.startsWith('-')) || '';
+
+  try {
+    switch (cmd) {
+      case 'doctor': return cmdDoctor();
+      case 'resolve': return cmdResolve(cwd);
+      case 'refresh': return cmdRefresh(cwd);
+      case 'migrate': return cmdMigrate(cwd, argv);
+      case 'check': {
+        const rest = argv.filter(a => !a.startsWith('-'));
+        return cmdCheck(cwd, rest[1]);
+      }
+      case '':
+      case 'help':
+      case '--help':
+        usage(); return 0;
+      default:
+        process.stderr.write(`认不出的命令：${cmd}\n`);
+        usage(); return 2;
+    }
+  } catch (e) {
+    // 程序自身出错要显式报出来，不许静默当成「判过了」
+    const msg = e && e.stack ? e.stack : String(e);
+    if (WANT_JSON) {
+      process.stdout.write(JSON.stringify({ 结果: '程序自身出错', 说明: msg }, null, 2) + '\n');
+    } else {
+      process.stderr.write('tingle-core 自身出错（不是判定结论）：\n' + msg + '\n');
+    }
+    return 3;
+  }
+}
+
+process.exit(main());

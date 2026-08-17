@@ -13,6 +13,13 @@
 # 正因如此，把本脚本按绝对路径写进 ~/.codex/hooks.json 也照样工作，
 # 这是 Codex 未发现插件自带 hook 时的兜底路径（见 README「双侧差异」）。
 #
+# 本脚本不由 hooks.json 直接调用，而是经同目录的 run-hook.cmd 转交：Windows
+# 上由 run-hook.cmd 找到 Git Bash 再把活转出去，Unix 上它只是一层透明转发。
+# 本脚本的文件名也因此不带扩展名——名字里带 .sh，Claude Code 在 Windows 上
+# 会给命令自动前置 bash，于是拿 bash 去解释 run-hook.cmd，垫片当场失效。
+# 本脚本改名时三处必须同步：本文件的文件名、hooks.json 里传给 run-hook.cmd
+# 的那个参数、README 里教 Codex 手动登记的那段示例。
+#
 # hooks.json 里的 additionalContextLimit: 0 不要删——Codex 对 hook 注入
 # 内容默认约 2500 token，超出即 spill（存临时文件、只给模型头尾预览加
 # 路径），而本入口全文已逼近该默认值（实测 o200k_base 2376 / cl100k_base
@@ -37,9 +44,17 @@ escape_for_json() {
     printf '%s' "$s"
 }
 
+core_path="${PLUGIN_ROOT}/bin/tingle-core"
+core_escaped=$(escape_for_json "$core_path")
 using_tingle_escaped=$(escape_for_json "$using_tingle_content")
-session_context="<EXTREMELY_IMPORTANT>\ntingle 已激活。\n\n**以下是 tingle:using-tingle 入口 skill 的全文——在回应用户之前，先按它完成项目锚定与就绪路由；其余 skill 一律用 Skill 工具调用：**\n\n${using_tingle_escaped}\n</EXTREMELY_IMPORTANT>"
 
-printf '{\n  "hookSpecificOutput": {\n    "hookEventName": "SessionStart",\n    "additionalContext": "%s"\n  }\n}\n' "$session_context"
+# 程序的绝对路径必须随注入一起给出：tingle-core 不装进 PATH（不改使用者的
+# 环境、不加安装步骤），所以文档里凡写「跑 tingle <命令>」，模型都得知道
+# 实际该敲哪个路径。这一行就是那个来源，全家族只此一处。
+tingle_cmd_line="**tingle 程序在这台机器上的绝对路径**（各 skill 说的「跑 \`tingle <命令>\`」，实际敲的是它）：\n\n\`${core_escaped}\`\n\n用法：\`<上面那个路径> resolve\`、\`<上面那个路径> check <skill 名>\` 等；加 \`--cwd <项目文件夹>\` 可指定项目工作文件夹。它不在 PATH 上，一律用这个绝对路径调用。"
+
+session_context="<EXTREMELY_IMPORTANT>\ntingle 已激活。\n\n${tingle_cmd_line}\n\n**以下是 tingle:using-tingle 入口 skill 的全文——在回应用户之前，先按它完成项目锚定与就绪路由；其余 skill 一律用 Skill 工具调用：**\n\n${using_tingle_escaped}\n</EXTREMELY_IMPORTANT>"
+
+printf '{\n  "hookSpecificOutput": {\n    "hookEventName": "SessionStart",\n    "additionalContext": "%s"\n  }\n}\n' "$session_context" | cat
 
 exit 0
