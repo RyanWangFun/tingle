@@ -1,7 +1,7 @@
 {
   "name": "tingle",
-  "version": "0.8.1",
-  "description": "AI 营销操盘大脑——让 AI 当项目的操盘者，装载项目全部资料与决策记录，覆盖策略制定、执行、复盘、迭代、再策划全流程。以插件为载体：每台机器装一次，此后任何客户项目、任何成员都能跑；客户服务、策划、媒介、投流四条线共用同一份项目上下文，各环节判断互相衔接、对得上同一个 KPI。当前装载——项目初始化基础设施（会话入口 using-tingle、项目就绪 project-readiness、材料蒸馏 context-distill）、把一套已经在用的做法造成 skill 的 building-work-skill，以及首个工作 skill check-claim-citations（给成稿做文献引用校对并交出标注好的稿件）。插件会长大：每个项目跑出来的经验与方法论沉淀回来，所有项目即时复用，越用越强。",
+  "version": "0.8.2",
+  "description": "AI 营销操盘大脑——让 AI 当项目的操盘者，装载项目全部资料与决策记录，覆盖策略制定、执行、复盘、迭代、再策划全流程。以插件为载体：每台机器装一次，此后任何客户项目、任何成员都能跑；客户服务、策划、媒介、投流四条线共用同一份项目上下文，各环节判断互相衔接、对得上同一个 KPI。当前装载——项目初始化基础设施（会话入口 using-tingle、项目就绪 project-readiness、材料蒸馏 context-distill）、把一套已经在用的做法造成 skill 的 building-work-skill，以及三个工作 skill——check-claim-citations（给成稿做文献引用校对并交出标注好的稿件）、check-draft-compliance（给未发布的内容稿做送审前逐处核查，交出判定与可直接替换的改法）、check-cut-against-baseline（给已制作的成片做交付前逐时点核对，交出带时间定位的返工清单）。插件会长大：每个项目跑出来的经验与方法论沉淀回来，所有项目即时复用，越用越强。",
   "author": {
     "name": "Ryan"
   },
