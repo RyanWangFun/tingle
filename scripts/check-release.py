@@ -231,6 +231,35 @@ def check_input_contract(skills):
     except ImportError:
         note("[契约] 未装 PyYAML，跳过清单块的 YAML 合法性检查（pip install pyyaml 可开启）")
 
+    # 6.1b 每个用到的形态，形态定义里要有条目、产不产段里要有判法。
+    #      起因：清单加了「提炼件」这一形态，但「产不产」段没跟着分叉，于是那一段
+    #      仍只有「对着 raw/ 问，全无则不产」一套判法——而提炼件不另收料，拿它去问
+    #      永远答「全无」，结果是每个项目都把它静默判成「本项目无料·未产」。
+    #      比停机更难发现：不产、不算缺、不催，没人会知道。
+    try:
+        import yaml as _y
+        _d = _y.safe_load(ym.group(1))
+        used = {it.get("形态") for it in (_d.get("认知件套") or []) if it.get("形态")}
+        defined = set((_d.get("形态定义") or {}).keys())
+        for f in sorted(used - defined):
+            fail(f"[契约] 清单里有件用了形态「{f}」，但「形态定义」段里没有它的条目")
+        pnp = _d.get("产不产") or {}
+        judged = set()
+        for k, v in pnp.items():
+            if isinstance(v, dict):
+                ap = v.get("适用形态")
+                if ap:
+                    judged |= {x.strip() for x in re.split(r"[／/、]", ap) if x.strip()}
+                elif k in used:
+                    judged.add(k)
+        for f in sorted(used - judged):
+            fail(f"[契约] 清单里有件用了形态「{f}」，但「产不产」段里没有对它的判法——"
+                 f"缺判法不会报错，只会被另一支的判法误判，且误判是静默的")
+    except ImportError:
+        pass
+    except Exception as e:
+        note(f"[契约] 形态覆盖检查跳过（清单块解析异常：{str(e).splitlines()[0][:60]}）")
+
     # 6.2 件名 → 形态
     forms = dict(re.findall(r"- 件名:\s*(\S+)\s*\n\s*形态:\s*(\S+)", block))
     if not forms:
