@@ -23,7 +23,7 @@
 const fs = require('fs');
 const path = require('path');
 const os = require('os');
-const { execFileSync } = require('child_process');
+const { execFileSync, spawn } = require('child_process');
 
 // ─────────────────────────────────────────────────────────────
 // 常量
@@ -84,6 +84,21 @@ function readFileSafe(p) {
 
 function existsSafe(p) {
   try { fs.accessSync(p); return true; } catch (e) { return false; }
+}
+
+/** 跑一条任意命令，只为探测它在不在、跑不跑得通。永不抛异常。 */
+function run(cmd, args, timeout) {
+  try {
+    const out = execFileSync(cmd, args, {
+      encoding: 'utf8',
+      timeout: timeout || 15000,
+      maxBuffer: 4 * 1024 * 1024,
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    return { ok: true, stdout: out };
+  } catch (e) {
+    return { ok: false, stdout: e && e.stdout ? String(e.stdout) : '' };
+  }
 }
 
 /** 跑一条 lark-cli 命令。永不抛异常，一律回结构化结果。 */
@@ -439,9 +454,26 @@ function cmdDoctor() {
     lacks.push({ 项: 'tingle 插件', 缺什么: '插件目录不完整', 怎么补: '经插件市场重装 tingle' });
   }
 
+  // 五、GitHub 命令行工具（自建 skill 提 PR 入仓要用）
+  //     装没装＝缺一样（挡就绪）；登没登录＝只记一条，不挡——
+  //     登录是提 PR 那一刻才用得上的一次浏览器操作，不该挡住一个从不造 skill 的人开工。
+  const ghVer = run('gh', ['--version'], 15000);
+  if (!ghVer.ok) {
+    lacks.push({
+      项: 'GitHub 命令行工具',
+      缺什么: 'gh 没装或不在 PATH 上',
+      怎么补: 'macOS：brew install gh；Windows：winget install --id GitHub.cli',
+    });
+  } else {
+    const ghAuth = run('gh', ['auth', 'status'], 20000);
+    notes.push(ghAuth.ok
+      ? 'GitHub 命令行工具已装、已登录'
+      : 'GitHub 命令行工具已装但未登录（只在给插件提 PR 时才用得上，届时跑 gh auth login）');
+  }
+
   const payload = { 命令: 'doctor', 缺什么: lacks, 顺带查到的: notes };
   if (lacks.length === 0) {
-    emit(payload, ['doctor：本机三样齐了。', ...bullet(notes)]);
+    emit(payload, ['doctor：本机装备齐了。', ...bullet(notes)]);
     return 0;
   }
   emit(payload, [
@@ -1018,6 +1050,1090 @@ function cmdCheck(cwd, skillName) {
 }
 
 // ─────────────────────────────────────────────────────────────
+// 自动化（auto 命令族）
+//
+// 分工：本段只管机械的五件——收声明并校验、装到本机、按时唤起 agent、
+// 记跑成什么样、撤掉。「这件活该不该自动、该定哪一档」全归
+// building-automation 主手册，程序不判。
+//
+// **执行的真相源在本机**（`.tingle/automations.json`，与本地指针同一个交点：
+// 随项目变 ＋ 只属于这台机器）。auto run 只读本机——早上九点机器醒来时
+// 不联网、不看授权脸色、不要求项目已就绪，照跑。
+// 飞书上那张公示表由 building-automation 在放行后登记，供防重复与交接；
+// 它**不参与任何一次运行**，读不到也不影响。程序一如既往不写飞书。
+// ─────────────────────────────────────────────────────────────
+
+const AUTO_STORE_VERSION = 1;
+const AUTO_STORE_REL = path.join('.tingle', 'automations.json');
+const AUTO_RUNS_REL = path.join('.tingle', 'runs');
+const AUTO_RUN_TIMEOUT_MS = 30 * 60 * 1000;
+
+/** 声明里必须有值的格（前置条件可空，`_` 开头的是本机状态、不由人填）。 */
+const AUTO_REQUIRED = [
+  '触发类', '触发表达式', '动作说明', '输入从哪来',
+  '产出写到哪', '危害档', '定档理由', '认领人', '开关',
+];
+
+/**
+ * 危害档 → 两侧无头调用的机械闸。**这张表是唯一实现**；
+ * building-automation 的参考件里那张是它的说明副本，两处不一致以本表为准。
+ *
+ * 一档的 Bash 白名单是 fail-closed 的：漏掉的命令跑不起来，使用者会来报；
+ * 不会出现「漏了一条于是悄悄写出去了」。方向上宁可跑不动，不可跑过头。
+ */
+const HAZARD = {
+  '一档-只看': {
+    installable: true,
+    claude: {
+      allowedTools: [
+        'Read', 'Glob', 'Grep', 'Skill',
+        'Bash(lark-cli * list*)', 'Bash(lark-cli * get*)',
+        'Bash(lark-cli * search*)', 'Bash(lark-cli schema*)',
+      ],
+      permissionMode: 'acceptEdits',
+    },
+    codex: { sandbox: 'read-only' },
+  },
+  '二档-写自家地盘': {
+    installable: true,
+    claude: {
+      allowedTools: [
+        'Read', 'Write', 'Edit', 'Glob', 'Grep', 'Skill',
+        'Bash(lark-cli *)',
+      ],
+      permissionMode: 'acceptEdits',
+    },
+    codex: { sandbox: 'workspace-write' },
+  },
+  '三档-出门或抹改': {
+    installable: false,
+    拒装理由: '三档是对外或不可逆的动作，不许无人值守。拆成两条：一条二档的「发现并记下来」，一条人在场时才做的「发出去」。',
+  },
+};
+
+/**
+ * 触发源清单——**这是一份可增长的表，不是固定枚举**。
+ * 加一种触发源＝往这张表加一行 ＋ 写它的装法；**动作层（提示词、危害档、旗标、日志）一个字不动**。
+ * 触发源与动作层之间唯一的契约是一句：**该跑的时候调 `auto run <名字>`。**
+ *
+ * `装法` 四种：
+ *   os-日历   → 操作系统按时点唤醒（launchd StartCalendarInterval／schtasks）
+ *   os-盯路径 → 操作系统盯文件变化后唤醒（launchd WatchPaths；Windows 无对应物）
+ *   会话内     → 不装任何常驻物，人在场时由会话入口捎带（因而不走无头那套）
+ *   接力       → 不装任何常驻物，由上游那条跑完后唤起
+ *   听着       → 需要一个常驻进程听外部事件（尚未实现，留位）
+ */
+const TRIGGERS = {
+  '时点': {
+    装法: 'os-日历',
+    参数说明: '5 段 cron：分 时 日 月 周，用本机时区',
+    无头: true, 已实现: true, 两侧: 'macOS 与 Windows 都行',
+  },
+  '文件变化': {
+    装法: 'os-盯路径',
+    参数说明: '要盯的路径，一行一个；相对路径按项目工作文件夹算',
+    无头: true, 已实现: true, 两侧: '**只 macOS**——Windows 上没有对应的原生机制，本版不支持',
+  },
+  '一开工就跑': {
+    装法: '会话内',
+    参数说明: '节流：每次 ／ 每天一次 ／ 每周一次',
+    无头: false, 已实现: true, 两侧: 'macOS 与 Windows 都行',
+  },
+  '跑完接力': {
+    装法: '接力',
+    参数说明: '上游那条自动化的名字',
+    无头: true, 已实现: true, 两侧: 'macOS 与 Windows 都行',
+  },
+  '飞书事件': {
+    装法: '听着',
+    参数说明: '事件名，跑 `lark-cli event list` 看有哪些（如 minutes.minute.generated_v1）',
+    无头: true, 已实现: true, 两侧: '**只 macOS**——要一个常驻进程，Windows 侧本版不支持',
+  },
+  '邮件到达': {
+    装法: '听着',
+    参数说明: '要盯的邮件文件夹，留空即收件箱（如 inbox）',
+    无头: true, 已实现: true, 两侧: '**只 macOS**——同上',
+  },
+};
+
+const 会话节流 = ['每次', '每天一次', '每周一次'];
+
+/** 那一格可能写成「一档」「一档-只看」「一档 · 只看」，一律归到同一个键。 */
+function hazardKey(raw) {
+  const s = String(raw === undefined || raw === null ? '' : raw).trim();
+  if (/^一档/.test(s)) return '一档-只看';
+  if (/^二档/.test(s)) return '二档-写自家地盘';
+  if (/^三档/.test(s)) return '三档-出门或抹改';
+  return null;
+}
+
+// ── cron ────────────────────────────────────────────────────
+
+const CRON_FIELDS = [
+  { key: 'minute', min: 0, max: 59, plist: 'Minute' },
+  { key: 'hour', min: 0, max: 23, plist: 'Hour' },
+  { key: 'day', min: 1, max: 31, plist: 'Day' },
+  { key: 'month', min: 1, max: 12, plist: 'Month' },
+  { key: 'weekday', min: 0, max: 7, plist: 'Weekday' },
+];
+
+/** 一段 cron 字段 → null（每一个值都算）或升序取值数组；写法不合法回 {error}。 */
+function parseCronField(spec, min, max) {
+  if (spec === '*') return null;
+  const out = new Set();
+  for (const part of spec.split(',')) {
+    let m;
+    if ((m = part.match(/^\*\/(\d+)$/))) {
+      const step = parseInt(m[1], 10);
+      if (!step) return { error: `步长不能是 0：${part}` };
+      for (let v = min; v <= max; v += step) out.add(v);
+    } else if ((m = part.match(/^(\d+)-(\d+)(?:\/(\d+))?$/))) {
+      const a = parseInt(m[1], 10), b = parseInt(m[2], 10);
+      const step = m[3] ? parseInt(m[3], 10) : 1;
+      if (!step || a > b || a < min || b > max) return { error: `区间写法不合法：${part}` };
+      for (let v = a; v <= b; v += step) out.add(v);
+    } else if ((m = part.match(/^(\d+)$/))) {
+      const v = parseInt(m[1], 10);
+      if (v < min || v > max) return { error: `取值超出 ${min}-${max}：${part}` };
+      out.add(v);
+    } else {
+      return { error: `认不出的写法：${part}` };
+    }
+  }
+  return Array.from(out).sort((a, b) => a - b);
+}
+
+/** 5 段 cron → { ok, fields } 或 { ok:false, error }。 */
+function parseCron(expr) {
+  const parts = String(expr || '').trim().split(/\s+/);
+  if (parts.length !== 5) {
+    return { ok: false, error: `时点要写成 5 段（分 时 日 月 周），现在是 ${parts.length} 段：${expr}` };
+  }
+  const fields = {};
+  for (let i = 0; i < 5; i++) {
+    const f = CRON_FIELDS[i];
+    const r = parseCronField(parts[i], f.min, f.max);
+    if (r && r.error) return { ok: false, error: `第 ${i + 1} 段（${f.key}）${r.error}` };
+    // cron 里 0 与 7 都是周日，launchd 只认 0
+    fields[f.key] = Array.isArray(r) && f.key === 'weekday'
+      ? Array.from(new Set(r.map(v => (v === 7 ? 0 : v)))).sort((a, b) => a - b)
+      : r;
+  }
+  return { ok: true, fields, raw: String(expr).trim() };
+}
+
+/**
+ * cron → launchd 的 StartCalendarInterval 字典数组。
+ * 值为 `*` 的段整段不写键——launchd 的语义就是「这一维不限」，与 cron 一致。
+ */
+function launchdIntervals(fields) {
+  const active = CRON_FIELDS.filter(f => fields[f.key] !== null);
+  if (!active.length) return { ok: false, error: '五段全是 *（每分钟都跑）——这不像是想要的，把时点写具体些' };
+  let combos = [{}];
+  for (const f of active) {
+    const next = [];
+    for (const base of combos) {
+      for (const v of fields[f.key]) next.push(Object.assign({}, base, { [f.plist]: v }));
+    }
+    combos = next;
+    if (combos.length > 200) {
+      return { ok: false, error: '这个时点展开成了 200 条以上的日程，写法太细——换个粗一点的写法' };
+    }
+  }
+  return { ok: true, intervals: combos };
+}
+
+// ── 本机这一份（执行的真相源）────────────────────────────────
+
+function readAutoStore(cwd) {
+  const p = path.join(cwd, AUTO_STORE_REL);
+  const 空 = { tingle_automations_version: AUTO_STORE_VERSION, automations: {} };
+  const raw = readFileSafe(p);
+  if (raw === null) return { path: p, value: 空, 新的: true };
+  try {
+    const v = JSON.parse(raw);
+    if (!v || typeof v !== 'object' || typeof v.automations !== 'object' || v.automations === null) {
+      return { path: p, value: 空, 坏了: true };
+    }
+    return { path: p, value: v };
+  } catch (e) {
+    return { path: p, value: 空, 坏了: true };
+  }
+}
+
+function writeAutoStore(cwd, value) {
+  const p = path.join(cwd, AUTO_STORE_REL);
+  fs.mkdirSync(path.dirname(p), { recursive: true });
+  fs.writeFileSync(p, JSON.stringify(value, null, 2) + '\n', 'utf8');
+  return p;
+}
+
+/** 机械校验一份声明。只查「格齐不齐、写法对不对」，不判这活该不该自动。 */
+function validateDeclaration(name, d) {
+  const 毛病 = [];
+  if (!/^[a-z0-9][a-z0-9-]*$/.test(String(name || ''))) {
+    毛病.push(`名字「${name}」不合规——只许小写字母、数字与连字符，且不以连字符开头`);
+  }
+  for (const k of AUTO_REQUIRED) {
+    if (!isNonEmpty(d[k])) 毛病.push(`「${k}」这一格是空的`);
+  }
+  const tg = TRIGGERS[String(d.触发类 || '').trim()];
+  if (isNonEmpty(d.触发类) && !tg) {
+    毛病.push(`触发类认不出：「${d.触发类}」——现有这几种：${Object.keys(TRIGGERS).join('／')}`);
+  } else if (tg && !tg.已实现) {
+    毛病.push(`触发类「${d.触发类}」还没实现（${tg.两侧}）——声明格式已经容得下它，等实现了原样收下`);
+  }
+  if (isNonEmpty(d.危害档) && !hazardKey(d.危害档)) {
+    毛病.push(`危害档认不出：「${d.危害档}」——取值只有三个：一档-只看／二档-写自家地盘／三档-出门或抹改`);
+  }
+  if (isNonEmpty(d.开关) && !['启用', '停用'].includes(String(d.开关).trim())) {
+    毛病.push(`开关是「${d.开关}」——取值只有「启用」「停用」两个`);
+  }
+  if (isNonEmpty(d.触发表达式) && tg && tg.已实现) {
+    const 表达式 = String(d.触发表达式).trim();
+    if (tg.装法 === 'os-日历') {
+      const c = parseCron(表达式);
+      if (!c.ok) 毛病.push(c.error);
+    } else if (tg.装法 === 'os-盯路径') {
+      const 路径 = 表达式.split(/\r?\n/).map(x => x.trim()).filter(Boolean);
+      if (!路径.length) 毛病.push('文件变化触发要至少给一条路径');
+      if (isWindows()) 毛病.push('文件变化这一类本版只支持 macOS——Windows 上没有对应的原生机制');
+    } else if (tg.装法 === '会话内') {
+      if (!会话节流.includes(表达式)) {
+        毛病.push(`一开工就跑的触发表达式是节流档，取值只有：${会话节流.join('／')}；现在写的是「${表达式}」`);
+      }
+    } else if (tg.装法 === '接力') {
+      if (表达式 === name) 毛病.push('跑完接力不能接自己');
+    } else if (tg.装法 === '听着') {
+      if (isWindows()) 毛病.push(`「${d.触发类}」这一类本版只支持 macOS——它要一个常驻进程`);
+      if (d.触发类 === '飞书事件' && !/^[a-z][\w.]*$/.test(表达式)) {
+        毛病.push(`飞书事件的触发表达式要写事件名（跑 lark-cli event list 看有哪些），现在写的是「${表达式}」`);
+      }
+    }
+  }
+  return { ok: 毛病.length === 0, 毛病 };
+}
+
+// ── 装到本机 ────────────────────────────────────────────────
+
+function jobLabel(projectId, name) {
+  const safe = s => String(s || '').replace(/[^A-Za-z0-9._-]/g, '-');
+  return `com.tingle.${safe(projectId) || 'project'}.${safe(name)}`;
+}
+
+function plistEscape(s) {
+  return String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+}
+
+function launchdPlistPath(label) {
+  return path.join(os.homedir(), 'Library', 'LaunchAgents', `${label}.plist`);
+}
+
+/**
+ * 生成 launchd plist。`唤醒` 二选一：
+ *   { 日历: [ {Minute:0,Hour:9}, … ] }   到点唤醒
+ *   { 盯路径: ['/abs/path', …] }          路径变了唤醒（WatchPaths）
+ */
+function buildPlist(label, corePath, cwd, name, 唤醒, logDir) {
+  const intervals = 唤醒.日历 || null;
+  const 盯 = 唤醒.盯路径 || null;
+  const 常驻 = Boolean(唤醒.常驻);
+  const dicts = (intervals || []).map(d => {
+    const inner = Object.entries(d)
+      .map(([k, v]) => `      <key>${k}</key>\n      <integer>${v}</integer>`)
+      .join('\n');
+    return `    <dict>\n${inner}\n    </dict>`;
+  }).join('\n');
+  return [
+    '<?xml version="1.0" encoding="UTF-8"?>',
+    '<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">',
+    '<plist version="1.0">',
+    '<dict>',
+    '  <key>Label</key>',
+    `  <string>${plistEscape(label)}</string>`,
+    '  <key>ProgramArguments</key>',
+    '  <array>',
+    `    <string>${plistEscape(corePath)}</string>`,
+    '    <string>auto</string>',
+    `    <string>${常驻 ? 'listen' : 'run'}</string>`,
+    `    <string>${plistEscape(name)}</string>`,
+    '    <string>--cwd</string>',
+    `    <string>${plistEscape(cwd)}</string>`,
+    '  </array>',
+    ...(intervals ? [
+      '  <key>StartCalendarInterval</key>',
+      '  <array>',
+      dicts,
+      '  </array>',
+    ] : []),
+    ...(盯 ? [
+      '  <key>WatchPaths</key>',
+      '  <array>',
+      ...盯.map(x => `    <string>${plistEscape(x)}</string>`),
+      '  </array>',
+    ] : []),
+    '  <key>RunAtLoad</key>',
+    常驻 ? '  <true/>' : '  <false/>',
+    '  <key>KeepAlive</key>',
+    常驻 ? '  <true/>' : '  <false/>',
+    ...(常驻 ? ['  <key>ThrottleInterval</key>', '  <integer>30</integer>'] : []),
+    '  <key>StandardOutPath</key>',
+    `  <string>${plistEscape(path.join(logDir, name + '.launchd.out.log'))}</string>`,
+    '  <key>StandardErrorPath</key>',
+    `  <string>${plistEscape(path.join(logDir, name + '.launchd.err.log'))}</string>`,
+    '  <key>EnvironmentVariables</key>',
+    '  <dict>',
+    '    <key>PATH</key>',
+    `    <string>${plistEscape([path.join(os.homedir(), '.local', 'bin'), '/opt/homebrew/bin', '/usr/local/bin', '/usr/bin', '/bin', '/usr/sbin', '/sbin'].join(':'))}</string>`,
+    '    <key>HOME</key>',
+    `    <string>${plistEscape(os.homedir())}</string>`,
+    '    <key>LANG</key>',
+    '    <string>en_US.UTF-8</string>',
+    '  </dict>',
+    '</dict>',
+    '</plist>',
+    '',
+  ].join('\n');
+}
+
+/** cron → schtasks 参数。只认四种常见写法，认不出就明说不支持，不硬凑。 */
+function schtasksArgs(fields, label, corePath, cwd, name) {
+  const one = k => (Array.isArray(fields[k]) && fields[k].length === 1 ? fields[k][0] : null);
+  const any = k => fields[k] === null;
+  const pad = n => String(n).padStart(2, '0');
+  const cmd = `"${corePath}" auto run "${name}" --cwd "${cwd}"`;
+  const base = ['/Create', '/F', '/TN', label, '/TR', cmd];
+
+  const mi = one('minute'), h = one('hour');
+  if (mi !== null && h !== null && any('day') && any('month') && any('weekday')) {
+    return { ok: true, args: base.concat(['/SC', 'DAILY', '/ST', `${pad(h)}:${pad(mi)}`]) };
+  }
+  if (mi !== null && h !== null && any('day') && any('month') && Array.isArray(fields.weekday)) {
+    const map = ['SUN', 'MON', 'TUE', 'WED', 'THU', 'FRI', 'SAT'];
+    return { ok: true, args: base.concat(['/SC', 'WEEKLY', '/D', fields.weekday.map(d => map[d]).join(','), '/ST', `${pad(h)}:${pad(mi)}`]) };
+  }
+  if (mi !== null && h !== null && Array.isArray(fields.day) && fields.day.length === 1 && any('month') && any('weekday')) {
+    return { ok: true, args: base.concat(['/SC', 'MONTHLY', '/D', String(fields.day[0]), '/ST', `${pad(h)}:${pad(mi)}`]) };
+  }
+  if (Array.isArray(fields.minute) && fields.minute.length > 1 && any('hour') && any('day') && any('month') && any('weekday')) {
+    const step = fields.minute[1] - fields.minute[0];
+    if (step > 0) return { ok: true, args: base.concat(['/SC', 'MINUTE', '/MO', String(step)]) };
+  }
+  return { ok: false, error: 'Windows 上这条时点写法暂不支持——改成每日、每周、每月或每 N 分钟四种写法之一' };
+}
+
+function isWindows() { return process.platform === 'win32'; }
+
+/**
+ * 作业到底登记上没有——**看事实，不看命令的退出码**。
+ * 起因：重复 bootstrap 一个已在册的作业会报「Bootstrap failed: 5」，
+ * 而 bootout 与 bootstrap 之间有时差；只信退出码会在两个方向上都判错——
+ * 装上了报失败，或没装上报成功。后者尤其坏：到点不跑，还没人知道。
+ */
+function jobRegistered(label) {
+  if (isWindows()) {
+    return runLocal('schtasks', ['/Query', '/TN', label]).ok;
+  }
+  return runLocal('launchctl', ['print', `gui/${process.getuid()}/${label}`]).ok;
+}
+
+function runLocal(file, args) {
+  try {
+    const out = execFileSync(file, args, { encoding: 'utf8', timeout: 30000, stdio: ['ignore', 'pipe', 'pipe'] });
+    return { ok: true, stdout: out };
+  } catch (e) {
+    return { ok: false, error: ((e.stderr && String(e.stderr)) || e.message || '').trim().split('\n')[0] };
+  }
+}
+
+// ── 唤起 agent ──────────────────────────────────────────────
+
+function detectAgents() {
+  const found = [];
+  for (const name of ['claude', 'codex']) {
+    const r = runLocal(isWindows() ? 'where' : 'which', [name]);
+    if (r.ok && r.stdout.trim()) found.push(name);
+  }
+  return found;
+}
+
+function buildPrompt(name, d, projectId) {
+  const 段 = [];
+  段.push(`你正在为项目「${projectId}」执行一条已被授权的自动化。现场没有人可以追问。`);
+  段.push('');
+  段.push(`自动化名字：${name}`);
+  段.push(`本次触发：定时触发（${d.触发表达式}）`);
+  if (isNonEmpty(d.前置条件)) 段.push(`前置条件：${d.前置条件}`);
+  段.push('');
+  段.push('要干的活：');
+  段.push(d.动作说明);
+  段.push('');
+  段.push('输入从哪来：');
+  段.push(d.输入从哪来);
+  段.push('');
+  段.push('产出写到哪：');
+  段.push(d.产出写到哪);
+  段.push('');
+  段.push('规矩（越一条即本次作废）：');
+  段.push('- 前置条件不满足就什么都别做，只在结论里写明「前置条件不满足，本次不跑」。');
+  段.push('- 只往上面写明的落点写，别处一律不写。');
+  段.push('- 不许执行任何需要 --yes 的命令。');
+  段.push('- 输入取不到就停，把取不到的是哪一样写进结论，不要找替代、不要猜。');
+  段.push('- 判不准就停下，把判不准的地方写进结论，不要挑一个解释混过去。');
+  段.push('- 最后输出一段结论：做了什么、产出在哪、有没有异常。');
+  return 段.join('\n');
+}
+
+function buildAgentCommand(agent, hazard, prompt, cwd) {
+  const gate = HAZARD[hazard];
+  if (agent === 'claude') {
+    const args = ['-p', prompt, '--permission-mode', gate.claude.permissionMode, '--allowedTools'];
+    return { file: 'claude', args: args.concat(gate.claude.allowedTools), cwd };
+  }
+  if (agent === 'codex') {
+    return {
+      file: 'codex',
+      args: ['exec', prompt, '--sandbox', gate.codex.sandbox, '-C', cwd, '--skip-git-repo-check'],
+      cwd,
+    };
+  }
+  return null;
+}
+
+/** 「听着」这一类的长驻命令：两种触发源、同一个形状（一行一个 JSON 流出来）。 */
+function listenCommand(d) {
+  const 表达式 = String(d.触发表达式 || '').trim();
+  if (d.触发类 === '飞书事件') {
+    return { file: 'lark-cli', args: ['event', 'consume', 表达式, '--quiet'] };
+  }
+  if (d.触发类 === '邮件到达') {
+    const args = ['mail', '+watch', '--format', 'json'];
+    if (表达式) args.push('--folders', JSON.stringify([表达式]));
+    return { file: 'lark-cli', args };
+  }
+  return null;
+}
+
+/**
+ * 筛选：程序只做**全文包含**匹配——筛选条件里空格分隔的每个词都得出现在这一行事件里。
+ * 不做 jq、不做正则：同事写得出来的才叫能用；写错了的后果是不触发（fail-safe），
+ * 不是乱触发。判"这条到底该不该处理"的细活留给被唤起的 agent。
+ */
+function 事件命中(line, 筛选条件) {
+  const c = String(筛选条件 || '').trim();
+  if (!c) return true;
+  return c.split(/\s+/).every(w => line.includes(w));
+}
+
+/**
+ * 装之前先试听一小会儿——**装上了却永远不响、还没人知道，是最坏的一种失败**。
+ * 缺权限、事件没在后台订阅这类问题，此刻就能拿到确切的错与修法，不必等到某天发现"它怎么一直没动静"。
+ */
+function 听得到吗(d) {
+  // 判据用退出码，不猜文本：consume 的超时是正常退出（码 0），报错是非零。
+  // （曾按"第一行以 { 开头"去解析，而它吐的是多行美化 JSON，第一行只有一个左花括号，
+  //   解析失败被吞掉，于是把"听不到"判成了"听得到"。改按退出码判。）
+  const 摘错 = text => {
+    let j = null;
+    try { j = JSON.parse(text); } catch (e) { /* 不是整块 JSON，往下用正则 */ }
+    if (j && j.error) return { error: String(j.error.message || '听不到'), hint: String(j.error.hint || '') };
+    const m = text.match(/"message"\s*:\s*"([^"]+)"/);
+    const h = text.match(/"hint"\s*:\s*"([^"]+)"/);
+    return { error: m ? m[1] : (text.split('\n')[0] || '听不到').slice(0, 300), hint: h ? h[1] : '' };
+  };
+  if (d.触发类 === '飞书事件') {
+    const r = lark(['event', 'consume', String(d.触发表达式).trim(), '--timeout', '4s', '--quiet'], { timeout: 25000 });
+    if (r.ok) return { ok: true };
+    return Object.assign({ ok: false }, 摘错(((r.stdout || '') + (r.stderr || '')).trim()));
+  }
+  if (d.触发类 === '邮件到达') {
+    const r = lark(['mail', '+watch', '--format', 'json', '--dry-run'], { timeout: 25000 });
+    if (r.ok) return { ok: true };
+    return Object.assign({ ok: false }, 摘错(((r.stdout || '') + (r.stderr || '')).trim()));
+  }
+  return { ok: true };
+}
+
+function runsDir(cwd) {
+  const d = path.join(cwd, AUTO_RUNS_REL);
+  fs.mkdirSync(d, { recursive: true });
+  return d;
+}
+
+function recordRun(cwd, name, payload) {
+  const d = runsDir(cwd);
+  try {
+    fs.writeFileSync(path.join(d, `${name}.last.json`), JSON.stringify(payload, null, 2) + '\n', 'utf8');
+    fs.appendFileSync(
+      path.join(d, `${name}.log`),
+      `[${payload.跑于}] ${payload.结果}｜用时 ${payload.用时秒}s｜agent ${payload.agent || '-'}｜${payload.说明 || ''}\n`,
+      'utf8'
+    );
+  } catch (e) { /* 记不下来不该把这一次跑挂掉 */ }
+}
+
+/** 项目标识＝项目工作文件夹名（就绪契约的约定，取它不必联网）。 */
+function projectIdOf(cwd) {
+  return path.basename(path.resolve(cwd));
+}
+
+// ── 六条子命令 ──────────────────────────────────────────────
+
+function cmdAutoAdd(cwd, file) {
+  if (!file) { process.stderr.write('要收哪一份声明？tingle auto add <声明文件.json>\n'); return 2; }
+  const raw = readFileSafe(path.resolve(file));
+  if (raw === null) {
+    emit({ 命令: 'auto add', 结果: '收不下', 说明: `读不到这个文件：${file}` },
+      [`auto add：收不下`, `  说明：读不到这个文件：${file}`]);
+    return 1;
+  }
+  let obj;
+  try { obj = JSON.parse(raw); } catch (e) {
+    emit({ 命令: 'auto add', 结果: '收不下', 说明: 'JSON 解析不了：' + e.message },
+      ['auto add：收不下', '  说明：JSON 解析不了：' + e.message]);
+    return 1;
+  }
+  const name = String(obj.名字 || '').trim();
+  const d = Object.assign({}, obj);
+  delete d.名字;
+
+  const v = validateDeclaration(name, d);
+  if (!v.ok) {
+    emit({ 命令: 'auto add', 自动化: name, 结果: '收不下', 毛病: v.毛病 },
+      [`auto add ${name || '（没名字）'}：收不下，${v.毛病.length} 处不合规`, ...bullet(v.毛病)]);
+    return 1;
+  }
+
+  const store = readAutoStore(cwd);
+  const 覆盖 = Boolean(store.value.automations[name]);
+  const 旧本机 = 覆盖 ? store.value.automations[name]._本机 : undefined;
+  store.value.tingle_automations_version = AUTO_STORE_VERSION;
+  store.value.automations[name] = Object.assign({}, d, 旧本机 ? { _本机: 旧本机 } : {});
+  const p = writeAutoStore(cwd, store.value);
+
+  emit(
+    { 命令: 'auto add', 自动化: name, 结果: 覆盖 ? '改好了' : '收下了', 危害档: hazardKey(d.危害档), 存在: p },
+    [
+      `auto add ${name}：${覆盖 ? '改好了' : '收下了'}（还没装，本机不会跑）`,
+      `  时点：${d.触发表达式}｜危害档：${hazardKey(d.危害档)}｜开关：${d.开关}`,
+      `  存在：${p}`,
+      '',
+      `  下一步：先试跑看它会干什么 → tingle auto run ${name} --dry-run`,
+      `  确认无误再装上 → tingle auto install ${name}`,
+    ]
+  );
+  return 0;
+}
+
+function cmdAutoList(cwd) {
+  const store = readAutoStore(cwd);
+  const names = Object.keys(store.value.automations).sort();
+  const 条目 = names.map(n => {
+    const d = store.value.automations[n];
+    return {
+      名字: n,
+      触发: d.触发表达式,
+      危害档: hazardKey(d.危害档),
+      认领人: d.认领人,
+      开关: d.开关,
+      本机已装: Boolean(d._本机 && d._本机.label),
+    };
+  });
+  emit(
+    { 命令: 'auto list', 项目: projectIdOf(cwd), 共: 条目.length, 条目, 存在: store.path },
+    [
+      `auto list：本机这个项目下有 ${条目.length} 条自动化` + (store.坏了 ? '（原来那份读不出来，已当空的处理）' : ''),
+      ...条目.map(c => `  ${c.本机已装 ? '●' : '○'} ${c.名字}｜${c.触发}｜${c.危害档}｜认领人 ${c.认领人}｜${c.开关}`),
+      条目.length ? '' : '  （一条都没有。用 tingle auto add <声明文件.json> 收一条进来）',
+      条目.length ? '  ● = 定时任务已装　○ = 只收了声明、还没装' : null,
+    ]
+  );
+  return 0;
+}
+
+function cmdAutoInstall(cwd, name) {
+  if (!name) { process.stderr.write('要装哪一条？tingle auto install <名字>\n'); return 2; }
+  const store = readAutoStore(cwd);
+  const d = store.value.automations[name];
+  const 拒 = (说明, 修法) => {
+    emit({ 命令: 'auto install', 自动化: name, 结果: '拒绝安装', 说明, 修法 },
+      [`auto install ${name}：拒绝安装`, `  说明：${说明}`, 修法 ? `  修法：${修法}` : null]);
+    return 1;
+  };
+  if (!d) return 拒(`本机没收过叫「${name}」的自动化`, '先 tingle auto add <声明文件.json> 把声明收进来');
+
+  const v = validateDeclaration(name, d);
+  if (!v.ok) return 拒(`本机存着的这份声明有 ${v.毛病.length} 处不合规：${v.毛病.join('；')}`, '改好声明重新 auto add');
+  if (String(d.开关).trim() !== '启用') return 拒(`这条的开关是「${d.开关}」`, '要装先把声明里的开关改成「启用」，重新 auto add');
+
+  const tg = TRIGGERS[String(d.触发类).trim()];
+  const hz = hazardKey(d.危害档);
+  // 危害档那道拒装闸**只对无头类触发生效**——人在场的触发本来就有人把关，
+  // 三档（对外或不可逆）正是只许挂在这类触发上。
+  if (tg.无头 && !HAZARD[hz].installable) return 拒(`这条是${hz}，而「${d.触发类}」是没人看着的触发`, HAZARD[hz].拒装理由);
+
+  // 不装任何常驻物的两类：人在场时由会话入口捎带，或由上游跑完唤起。
+  if (tg.装法 === '会话内' || tg.装法 === '接力') {
+    d._本机 = { agent: null, 危害档: hz, label: null, 装于: new Date().toISOString(), 装法: tg.装法 === '会话内' ? '会话内捎带' : '由上游接力' };
+    writeAutoStore(cwd, store.value);
+    emit(
+      { 命令: 'auto install', 自动化: name, 结果: '就位了', 触发类: d.触发类, 装法: d._本机.装法, 危害档: hz },
+      [
+        `auto install ${name}：就位了（这一类不装定时任务）`,
+        tg.装法 === '会话内'
+          ? `  它在你每次开工时由会话入口捎带，节流：${d.触发表达式}。人在场，所以不走无头那套。`
+          : `  它在「${d.触发表达式}」跑成之后自动接上。`,
+      ]
+    );
+    return 0;
+  }
+
+  const agents = detectAgents();
+  if (!agents.length) return 拒('这台电脑上没找到可无头调用的 agent 命令行（claude／codex 都没有）', '先装上其中一个，再跑 tingle doctor 复验');
+  const 旧 = d._本机 || {};
+  const agent = agents.includes(旧.agent) ? 旧.agent : agents[0];
+
+  const label = jobLabel(projectIdOf(cwd), name);
+  const corePath = path.join(PLUGIN_ROOT, 'bin', 'tingle-core');
+  const logDir = runsDir(cwd);
+
+  // 盯路径：只 macOS，用 launchd 的 WatchPaths
+  if (tg.装法 === 'os-盯路径') {
+    if (isWindows()) return 拒('文件变化这一类本版只支持 macOS', 'Windows 上改用时点触发轮询近似');
+    const 盯 = String(d.触发表达式).split(/\r?\n/).map(x => x.trim()).filter(Boolean)
+      .map(x => (path.isAbsolute(x) ? x : path.resolve(cwd, x)));
+    const plist = launchdPlistPath(label);
+    fs.mkdirSync(path.dirname(plist), { recursive: true });
+    fs.writeFileSync(plist, buildPlist(label, corePath, cwd, name, { 盯路径: 盯 }, logDir), 'utf8');
+    runLocal('launchctl', ['bootout', `gui/${process.getuid()}/${label}`]);
+    const r0 = runLocal('launchctl', ['bootstrap', `gui/${process.getuid()}`, plist]);
+    if (!jobRegistered(label)) {
+      return 拒(`定时任务登记失败：${r0.error || '命令跑完了，但系统里查不到这个作业'}`, `手工跑一遍 launchctl bootstrap gui/$(id -u) ${plist} 看它报什么`);
+    }
+    d._本机 = { agent, 危害档: hz, label, 装于: new Date().toISOString(), 装法: 'launchd 盯路径' };
+    writeAutoStore(cwd, store.value);
+    emit(
+      { 命令: 'auto install', 自动化: name, 结果: '装上了', agent, 危害档: hz, 盯着: 盯, 装法: 'launchd 盯路径', 落点: plist },
+      [
+        `auto install ${name}：装上了（盯路径）`,
+        ...bullet(盯.map(x => '盯着：' + x)),
+        `  危害档：${hz}｜用哪个 agent 跑：${agent}`,
+        `  装在：${plist}`,
+        '  已复验：系统里查得到这个作业（不是只看命令退出码）。',
+        '',
+        '  提醒：路径一变它就醒——短时间内连着改多次会连着触发几次，动作本身要经得起重复跑。',
+      ]
+    );
+    return 0;
+  }
+
+  // 听着：常驻进程，launchd KeepAlive 托着
+  if (tg.装法 === '听着') {
+    if (isWindows()) return 拒(`「${d.触发类}」这一类本版只支持 macOS`, '它要一个常驻进程，Windows 侧另设计');
+    const 试听 = 听得到吗(d);
+    if (!试听.ok) {
+      return 拒(`现在听不到：${试听.error}`, 试听.hint || '把上面这条错处理掉再装——装上了却永远不响，比装不上更坏');
+    }
+    const plist = launchdPlistPath(label);
+    fs.mkdirSync(path.dirname(plist), { recursive: true });
+    fs.writeFileSync(plist, buildPlist(label, corePath, cwd, name, { 常驻: true }, logDir), 'utf8');
+    runLocal('launchctl', ['bootout', `gui/${process.getuid()}/${label}`]);
+    const r1 = runLocal('launchctl', ['bootstrap', `gui/${process.getuid()}`, plist]);
+    if (!jobRegistered(label)) {
+      return 拒(`常驻监听登记失败：${r1.error || '命令跑完了，但系统里查不到这个作业'}`, `手工跑一遍 launchctl bootstrap gui/$(id -u) ${plist} 看它报什么`);
+    }
+    d._本机 = { agent, 危害档: hz, label, 装于: new Date().toISOString(), 装法: 'launchd 常驻监听' };
+    writeAutoStore(cwd, store.value);
+    const lc = listenCommand(d);
+    emit(
+      { 命令: 'auto install', 自动化: name, 结果: '装上了', agent, 危害档: hz, 触发类: d.触发类, 听什么: `${lc.file} ${lc.args.join(' ')}`, 装法: 'launchd 常驻监听', 落点: plist },
+      [
+        `auto install ${name}：装上了（常驻监听）`,
+        `  听的是：${lc.file} ${lc.args.join(' ')}`,
+        d.筛选条件 ? `  筛选条件：${d.筛选条件}（这几个词都出现在事件里才算命中）` : '  筛选条件：没设——每一条事件都会触发',
+        `  最小间隔：${Number(d.最小间隔秒) > 0 ? d.最小间隔秒 : 60} 秒（防止刷屏把额度打光）`,
+        `  危害档：${hz}｜用哪个 agent 跑：${agent}`,
+        '  已复验：系统里查得到这个作业。',
+        '',
+        '  它挂了由系统自动拉起来。要先看它听不听得到，直接跑：',
+        `    tingle auto listen ${name} --cwd ${cwd}`,
+      ]
+    );
+    return 0;
+  }
+
+  const cron = parseCron(d.触发表达式);
+  if (!cron.ok) return 拒(cron.error, '时点写成 5 段 cron：分 时 日 月 周');
+
+  let 装法, 落点;
+  if (isWindows()) {
+    const sa = schtasksArgs(cron.fields, label, corePath, cwd, name);
+    if (!sa.ok) return 拒(sa.error, '换一种时点写法');
+    const rWin = runLocal('schtasks', sa.args);
+    if (!jobRegistered(label)) {
+      return 拒(`任务计划登记失败：${rWin.error || '命令跑完了，但查不到这个任务'}`, '手工跑一遍 schtasks /Query /TN <任务名> 看它报什么');
+    }
+    装法 = '任务计划（schtasks）'; 落点 = label;
+  } else {
+    const ivs = launchdIntervals(cron.fields);
+    if (!ivs.ok) return 拒(ivs.error, '把时点写具体些');
+    const plist = launchdPlistPath(label);
+    fs.mkdirSync(path.dirname(plist), { recursive: true });
+    fs.writeFileSync(plist, buildPlist(label, corePath, cwd, name, { 日历: ivs.intervals }, logDir), 'utf8');
+    runLocal('launchctl', ['bootout', `gui/${process.getuid()}/${label}`]); // 装过就先卸，幂等
+    const r = runLocal('launchctl', ['bootstrap', `gui/${process.getuid()}`, plist]);
+    if (!jobRegistered(label)) {
+      return 拒(`定时任务登记失败：${r.error || '命令跑完了，但系统里查不到这个作业'}`, `手工跑一遍 launchctl bootstrap gui/$(id -u) ${plist} 看它报什么`);
+    }
+    装法 = 'launchd'; 落点 = plist;
+  }
+
+  d._本机 = { agent, 危害档: hz, label, 装于: new Date().toISOString(), 装法 };
+  writeAutoStore(cwd, store.value);
+
+  emit(
+    { 命令: 'auto install', 自动化: name, 结果: '装上了', agent, 危害档: hz, 触发: cron.raw, 装法, 落点 },
+    [
+      `auto install ${name}：装上了`,
+      `  时点：${cron.raw}（本机时区）`,
+      `  危害档：${hz}`,
+      `  用哪个 agent 跑：${agent}`,
+      `  装在：${落点}（${装法}）`,
+      '  已复验：系统里查得到这个定时任务（不是只看命令退出码）。',
+      '',
+      '  机器睡着时错过的那一次会在唤醒后补跑，不会跳过——所以「每天 9 点」的准确含义是「9 点，或当天开机的那一刻」。',
+    ]
+  );
+  return 0;
+}
+
+function cmdAutoUninstall(cwd, name, argv) {
+  if (!name) { process.stderr.write('要撤哪一条？tingle auto uninstall <名字>\n'); return 2; }
+  const 连声明一起删 = argv.includes('--forget');
+  const store = readAutoStore(cwd);
+  const d = store.value.automations[name];
+  if (!d) {
+    emit({ 命令: 'auto uninstall', 自动化: name, 结果: '本机本来就没有这一条' },
+      [`auto uninstall ${name}：本机本来就没有这一条，什么都没做`]);
+    return 0;
+  }
+  const label = d._本机 && d._本机.label;
+  if (label) {
+    if (isWindows()) {
+      runLocal('schtasks', ['/Delete', '/F', '/TN', label]);
+    } else {
+      runLocal('launchctl', ['bootout', `gui/${process.getuid()}/${label}`]);
+      try { fs.unlinkSync(launchdPlistPath(label)); } catch (e) { /* 已经不在就算了 */ }
+    }
+    delete d._本机;
+  }
+  if (连声明一起删) delete store.value.automations[name];
+  writeAutoStore(cwd, store.value);
+  emit(
+    { 命令: 'auto uninstall', 自动化: name, 结果: label ? '撤了' : '本来就没装', 声明还在: !连声明一起删 },
+    [
+      `auto uninstall ${name}：${label ? '定时任务撤了' : '它本来就没装上'}`,
+      连声明一起删 ? '  声明也一起删了。' : '  声明还留着，将来要用 tingle auto install 就能再装回去（不想留就加 --forget）。',
+    ]
+  );
+  return 0;
+}
+
+function cmdAutoRun(cwd, name, argv) {
+  if (!name) { process.stderr.write('要跑哪一条？tingle auto run <名字>\n'); return 2; }
+  const dry = argv.includes('--dry-run');
+  const t0 = Date.now();
+  const 记 = (结果, 说明, agent) => {
+    if (dry) return;
+    recordRun(cwd, name, {
+      跑于: new Date().toISOString(), 结果, 说明: 说明 || '', agent: agent || null,
+      用时秒: Math.round((Date.now() - t0) / 1000),
+    });
+  };
+  const 报 = (结果, 说明, 修法) => {
+    记(结果, 说明);
+    emit({ 命令: 'auto run', 自动化: name, 结果, 说明, 修法 },
+      [`auto run ${name}：${结果}`, `  说明：${说明}`, 修法 ? `  修法：${修法}` : null]);
+    return 结果 === '跳过' ? 0 : 1;
+  };
+
+  const store = readAutoStore(cwd);
+  const d = store.value.automations[name];
+  if (!d) return 报('没跑成', `本机没有叫「${name}」的自动化`, '先 tingle auto add 把声明收进来');
+
+  const v = validateDeclaration(name, d);
+  if (!v.ok) return 报('没跑成', `声明有 ${v.毛病.length} 处不合规：${v.毛病.join('；')}`, '改好声明重新 auto add');
+  if (String(d.开关).trim() !== '启用') return 报('跳过', `开关是「${d.开关}」`);
+
+  const tg = TRIGGERS[String(d.触发类).trim()];
+  if (tg && tg.装法 === '会话内') {
+    // 不记运行日志——这是用法不对，不是"跑了一次没跑成"。记下去会把 status 弄脏，
+    // 也会让人以为这条自动化坏了。
+    const 说明 = '这一类是人在场时在会话里干的，不走无头进程';
+    emit({ 命令: 'auto run', 自动化: name, 结果: '不该这么跑', 说明, 修法: `跑 tingle auto due 看它该干什么，干完用 tingle auto done ${name} 记一笔` },
+      [`auto run ${name}：不该这么跑`, `  说明：${说明}`, `  修法：跑 tingle auto due 看它该干什么，干完用 tingle auto done ${name} 记一笔`]);
+    return 2;
+  }
+  const hz = hazardKey(d.危害档);
+  if (!HAZARD[hz].installable) return 报('没跑成', `${hz}不许无人值守`, HAZARD[hz].拒装理由);
+
+  const agents = detectAgents();
+  const 旧 = d._本机 || {};
+  const agent = agents.includes(旧.agent) ? 旧.agent : agents[0];
+  if (!agent) return 报('没跑成', '这台电脑上没找到 claude 或 codex');
+
+  const prompt = buildPrompt(name, d, projectIdOf(cwd));
+  const cmd = buildAgentCommand(agent, hz, prompt, cwd);
+
+  if (dry) {
+    emit(
+      { 命令: 'auto run', 自动化: name, 结果: '试运行（没真跑）', agent, 危害档: hz, 将要执行: [cmd.file].concat(cmd.args), 提示词: prompt },
+      [
+        `auto run ${name} --dry-run：这是它到点会干的事，本次没真跑`,
+        `  用哪个 agent：${agent}｜危害档：${hz}`,
+        `  工作文件夹：${cwd}`,
+        '',
+        '  将要执行的命令（提示词太长，下面单列）：',
+        `    ${cmd.file} ${cmd.args.map(a => (a === prompt ? '<提示词>' : a)).join(' ')}`,
+        '',
+        '  交给 agent 的提示词：',
+        ...prompt.split('\n').map(l => '    ' + l),
+      ]
+    );
+    return 0;
+  }
+
+  let 结果, 说明 = '', code = 0, tail = '';
+  try {
+    const out = execFileSync(cmd.file, cmd.args, {
+      cwd, encoding: 'utf8', timeout: AUTO_RUN_TIMEOUT_MS,
+      maxBuffer: 64 * 1024 * 1024, stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    结果 = '跑成了';
+    tail = String(out || '').trim().split('\n').slice(-15).join('\n');
+  } catch (e) {
+    结果 = '跑挂了';
+    code = typeof e.status === 'number' ? e.status : 1;
+    说明 = ((e.stderr && String(e.stderr)) || e.message || '').trim().split('\n').slice(0, 3).join('；').slice(0, 400);
+    tail = String((e.stdout && String(e.stdout)) || '').trim().split('\n').slice(-15).join('\n');
+  }
+  recordRun(cwd, name, {
+    跑于: new Date().toISOString(), 结果, 说明, agent, 危害档: hz,
+    用时秒: Math.round((Date.now() - t0) / 1000), 退出码: code, 尾部输出: tail,
+  });
+  // 接力：本条跑成了，唤起声明为「跑完接力」且上游是本条的那些。
+  const 接力 = [];
+  if (结果 === '跑成了') {
+    for (const [n2, d2] of Object.entries(store.value.automations)) {
+      if (n2 === name) continue;
+      if (String(d2.触发类 || '').trim() !== '跑完接力') continue;
+      if (String(d2.触发表达式 || '').trim() !== name) continue;
+      if (String(d2.开关 || '').trim() !== '启用') continue;
+      接力.push(n2);
+    }
+  }
+
+  emit(
+    { 命令: 'auto run', 自动化: name, 结果, agent, 危害档: hz, 退出码: code, 说明, 尾部输出: tail, 接力唤起: 接力 },
+    [
+      `auto run ${name}：${结果}`, 说明 ? `  说明：${说明}` : null,
+      '', '  agent 最后说的话：', ...tail.split('\n').map(l => '    ' + l),
+      接力.length ? `\n  接着唤起下游 ${接力.length} 条：${接力.join('、')}` : null,
+    ]
+  );
+  // 逐条跑下游。只跑一层——下游的下游由它自己那次运行去唤，不在这里递归展开，
+  // 免得一条链上出个环就把这次运行拖死。
+  for (const n2 of 接力) {
+    try { cmdAutoRun(cwd, n2, argv.filter(a => a !== '--dry-run')); } catch (e) { /* 下游挂了不该反过来把上游判成失败 */ }
+  }
+  return 结果 === '跑成了' ? 0 : 1;
+}
+
+/**
+ * 常驻监听：起长驻命令，逐行读，命中就跑一次动作。
+ * 由 launchd 以 KeepAlive 托着——它自己不管重启，挂了让 launchd 拉起来。
+ */
+function cmdAutoListen(cwd, name) {
+  if (!name) { process.stderr.write('要听哪一条？tingle auto listen <名字>\n'); return 2; }
+  const store = readAutoStore(cwd);
+  const d = store.value.automations[name];
+  if (!d) { process.stderr.write(`本机没有叫「${name}」的自动化\n`); return 1; }
+  const tg = TRIGGERS[String(d.触发类).trim()];
+  if (!tg || tg.装法 !== '听着') { process.stderr.write(`「${d.触发类}」不是要听的那一类\n`); return 2; }
+  if (String(d.开关).trim() !== '启用') { process.stderr.write(`开关是「${d.开关}」，不听\n`); return 0; }
+
+  const cmd = listenCommand(d);
+  const 最小间隔秒 = Number(d.最小间隔秒) > 0 ? Number(d.最小间隔秒) : 60;
+  let 上次触发 = 0;
+  let 缓冲 = '';
+
+  process.stderr.write(`[tingle] 开始听 ${name}：${cmd.file} ${cmd.args.join(' ')}（最小间隔 ${最小间隔秒}s）\n`);
+  const child = spawn(cmd.file, cmd.args, { cwd, stdio: ['ignore', 'pipe', 'inherit'] });
+
+  child.stdout.on('data', chunk => {
+    缓冲 += chunk.toString('utf8');
+    let i;
+    while ((i = 缓冲.indexOf('\n')) !== -1) {
+      const line = 缓冲.slice(0, i).trim();
+      缓冲 = 缓冲.slice(i + 1);
+      if (!line) continue;
+      if (!事件命中(line, d.筛选条件)) continue;
+      const now = Date.now();
+      if (now - 上次触发 < 最小间隔秒 * 1000) {
+        process.stderr.write(`[tingle] ${name} 命中但离上次不足 ${最小间隔秒}s，这条跳过\n`);
+        continue;
+      }
+      上次触发 = now;
+      process.stderr.write(`[tingle] ${name} 命中，跑一次\n`);
+      try { cmdAutoRun(cwd, name, []); } catch (e) { process.stderr.write(`[tingle] ${name} 跑挂了：${e && e.message}\n`); }
+    }
+  });
+
+  child.on('exit', code => {
+    process.stderr.write(`[tingle] 听 ${name} 的那条命令退出了（码 ${code}）——交给 launchd 拉起来\n`);
+    process.exit(code === null ? 1 : code);
+  });
+  return null; // 常驻，不返回退出码
+}
+
+/** 节流：这条「一开工就跑」的现在该不该跑。 */
+function 该跑了吗(cwd, name, 节流) {
+  if (节流 === '每次') return { 该跑: true, 上次: null };
+  const raw = readFileSafe(path.join(cwd, AUTO_RUNS_REL, `${name}.last.json`));
+  if (raw === null) return { 该跑: true, 上次: null };
+  let last = null;
+  try { last = JSON.parse(raw); } catch (e) { return { 该跑: true, 上次: null }; }
+  if (!last || !last.跑于) return { 该跑: true, 上次: null };
+  const 上次 = new Date(last.跑于);
+  if (isNaN(上次.getTime())) return { 该跑: true, 上次: null };
+  const 隔了天 = (Date.now() - 上次.getTime()) / 86400000;
+  if (节流 === '每天一次') {
+    const 同一天 = 上次.toDateString() === new Date().toDateString();
+    return { 该跑: !同一天, 上次: last.跑于 };
+  }
+  if (节流 === '每周一次') return { 该跑: 隔了天 >= 7, 上次: last.跑于 };
+  return { 该跑: true, 上次: last.跑于 };
+}
+
+/**
+ * 「一开工就跑」那一类现在有哪几条该干。
+ * 供会话入口调用：人在场，所以这一类不起无头进程，动作说明原样交给会话里的 AI 去干。
+ */
+function cmdAutoDue(cwd) {
+  const store = readAutoStore(cwd);
+  const 该干的 = [];
+  for (const [n, d] of Object.entries(store.value.automations)) {
+    const tg = TRIGGERS[String(d.触发类 || '').trim()];
+    if (!tg || tg.装法 !== '会话内') continue;
+    if (String(d.开关 || '').trim() !== '启用') continue;
+    if (!(d._本机 && d._本机.装法)) continue; // 没就位的不算
+    const j = 该跑了吗(cwd, n, String(d.触发表达式 || '每次').trim());
+    if (!j.该跑) continue;
+    该干的.push({
+      名字: n, 节流: d.触发表达式, 上次跑于: j.上次,
+      动作说明: d.动作说明, 输入从哪来: d.输入从哪来, 产出写到哪: d.产出写到哪,
+      前置条件: d.前置条件 || '', 危害档: hazardKey(d.危害档),
+    });
+  }
+  emit(
+    { 命令: 'auto due', 项目: projectIdOf(cwd), 共: 该干的.length, 该干的 },
+    该干的.length
+      ? [
+          `auto due：有 ${该干的.length} 条「一开工就跑」的现在该干`,
+          ...该干的.flatMap(x => [
+            ``,
+            `  ── ${x.名字}（${x.节流}${x.上次跑于 ? '，上次 ' + x.上次跑于 : '，还没跑过'}）`,
+            x.前置条件 ? `     前置条件：${x.前置条件}` : null,
+            `     要干的活：${x.动作说明}`,
+            `     输入从哪来：${x.输入从哪来}`,
+            `     产出写到哪：${x.产出写到哪}`,
+          ].filter(l => l !== null)),
+          '',
+          '  这一类人在场，就在会话里干，不起无头进程；干完一条跑 tingle auto done <名字> 记一笔。',
+        ]
+      : ['auto due：现在没有该干的（「一开工就跑」那一类）']
+  );
+  return 0;
+}
+
+/** 会话里干完了记一笔——节流靠它才算得准。 */
+function cmdAutoDone(cwd, name, argv) {
+  if (!name) { process.stderr.write('哪一条干完了？tingle auto done <名字>\n'); return 2; }
+  const store = readAutoStore(cwd);
+  if (!store.value.automations[name]) {
+    emit({ 命令: 'auto done', 自动化: name, 结果: '记不下' }, [`auto done ${name}：本机没有这一条，没记`]);
+    return 1;
+  }
+  const i = argv.indexOf('--note');
+  const 说明 = i !== -1 && argv[i + 1] ? argv[i + 1] : '会话内干的';
+  recordRun(cwd, name, { 跑于: new Date().toISOString(), 结果: '跑成了', 说明, agent: '会话内', 用时秒: 0 });
+  emit({ 命令: 'auto done', 自动化: name, 结果: '记下了', 说明 }, [`auto done ${name}：记下了（${说明}）`]);
+  return 0;
+}
+
+function cmdAutoStatus(cwd) {
+  const store = readAutoStore(cwd);
+  const d0 = path.join(cwd, AUTO_RUNS_REL);
+  const 条目 = Object.keys(store.value.automations).sort().map(n => {
+    const d = store.value.automations[n];
+    const 本机 = d._本机 || {};
+    let last = null;
+    const raw = readFileSafe(path.join(d0, `${n}.last.json`));
+    if (raw !== null) { try { last = JSON.parse(raw); } catch (e) { /* 日志坏了不该挡住看状态 */ } }
+    const tg = TRIGGERS[String(d.触发类 || '').trim()];
+    const 就位形态 = 本机.装法 || null;
+    return {
+      名字: n, 已装: Boolean(就位形态), 常驻或定时: Boolean(本机.label),
+      触发类: d.触发类, 就位形态, agent: 本机.agent || null,
+      危害档: hazardKey(d.危害档), 触发: d.触发表达式, 装于: 本机.装于 || null,
+      上次跑于: last ? last.跑于 : null,
+      上次结果: last ? last.结果 : '还没跑过',
+      上次说明: last ? last.说明 : '',
+    };
+  });
+  const 坏的 = 条目.filter(x => x.上次结果 === '跑挂了' || x.上次结果 === '没跑成');
+  emit(
+    { 命令: 'auto status', 项目: projectIdOf(cwd), 共: 条目.length, 已装: 条目.filter(x => x.已装).length, 上次没跑成的: 坏的.length, 条目 },
+    [
+      `auto status：本机这个项目下有 ${条目.length} 条，就位的 ${条目.filter(x => x.已装).length} 条`
+        + (坏的.length ? `，其中 ${坏的.length} 条上次没跑成` : ''),
+      ...条目.map(c => {
+        const mark = c.上次结果 === '跑成了' ? '✓' : c.上次结果 === '还没跑过' ? '·' : '✗';
+        const 形态 = c.已装 ? (c.常驻或定时 ? `${c.就位形态}／${c.agent}` : c.就位形态) : '还没就位';
+        return `  ${mark} ${c.名字}｜${c.触发类}：${c.触发}｜${c.危害档}｜${形态}｜上次：${c.上次结果}${c.上次说明 ? '（' + c.上次说明 + '）' : ''}`;
+      }),
+      条目.length ? `\n  详细日志在 ${d0}` : '  （一条都没有）',
+    ]
+  );
+  return 0;
+}
+
+function cmdAuto(cwd, argv) {
+  const rest = positionalArgs(argv);
+  const sub = rest[1] || '';
+  const arg = rest[2] || '';
+  switch (sub) {
+    case 'add': return cmdAutoAdd(cwd, arg);
+    case 'due': return cmdAutoDue(cwd);
+    case 'listen': return cmdAutoListen(cwd, arg);
+    case 'done': return cmdAutoDone(cwd, arg, argv);
+    case 'list': return cmdAutoList(cwd);
+    case 'install': return cmdAutoInstall(cwd, arg);
+    case 'uninstall': return cmdAutoUninstall(cwd, arg, argv);
+    case 'run': return cmdAutoRun(cwd, arg, argv);
+    case 'status': return cmdAutoStatus(cwd);
+    default:
+      process.stderr.write(
+        'auto 有九条：add <声明文件.json>（收一条进来）／list（本机有哪些）／install <名字>（装上）／'
+        + 'run <名字> [--dry-run]（无头跑一次）／listen <名字>（常驻听事件，一般由系统托管）／'
+        + 'due（人在场时有哪几条该干）／done <名字>（会话里干完了记一笔）／'
+        + 'status（跑成什么样）／uninstall <名字> [--forget]（撤掉）\n'
+      );
+      return 2;
+  }
+}
+
+// ─────────────────────────────────────────────────────────────
 // 入口
 // ─────────────────────────────────────────────────────────────
 
@@ -1034,11 +2150,38 @@ function usage() {
     '  tingle migrate --profile --apply   人放行后，吐出目标结构',
     '  tingle check <技能名>        这个技能这一次能不能跑',
     '',
+    '自动化（声明与状态都在本机；只有「听着」那一类会连飞书）：',
+    '  tingle auto add <声明.json>  收一条自动化声明进来（只收不装）',
+    '  tingle auto list             本机这个项目下有哪些自动化',
+    '  tingle auto install <名字>   让它就位（按触发类：装日历／盯路径／常驻监听／会话内捎带）',
+    '  tingle auto run <名字>       无头跑一次；加 --dry-run 只看它会干什么',
+    '  tingle auto listen <名字>    常驻听飞书事件／新邮件（装上后由系统托管，一般不手敲）',
+    '  tingle auto due              人在场时，现在有哪几条该干（会话入口用）',
+    '  tingle auto done <名字>      会话里干完了记一笔（节流靠它）',
+    '  tingle auto status           各条上次跑成什么样',
+    '  tingle auto uninstall <名字> 撤掉定时任务；加 --forget 连声明一起删',
+    '',
     '通用参数：',
     '  --json           吐 JSON 而不是人读格式',
     '  --cwd <路径>     指定项目工作文件夹（默认当前目录）',
     '',
   ].join('\n') + '\n');
+}
+
+/**
+ * 取位置参数：跳过所有旗标，**并跳过 --cwd 后面那个值**。
+ * 不跳它的话，`tingle check --cwd <路径> <技能名>` 会把路径当技能名——
+ * 这是 0.10.0 之前就在的毛病，加 auto 命令时被实测撞出来，一并修掉。
+ */
+function positionalArgs(argv) {
+  const out = [];
+  for (let i = 0; i < argv.length; i++) {
+    const a = argv[i];
+    if (a === '--cwd') { i++; continue; }
+    if (a.startsWith('-')) continue;
+    out.push(a);
+  }
+  return out;
 }
 
 function main() {
@@ -1056,10 +2199,8 @@ function main() {
       case 'resolve': return cmdResolve(cwd);
       case 'refresh': return cmdRefresh(cwd);
       case 'migrate': return cmdMigrate(cwd, argv);
-      case 'check': {
-        const rest = argv.filter(a => !a.startsWith('-'));
-        return cmdCheck(cwd, rest[1]);
-      }
+      case 'auto': return cmdAuto(cwd, argv);
+      case 'check': return cmdCheck(cwd, positionalArgs(argv)[1]);
       case '':
       case 'help':
       case '--help':
@@ -1080,4 +2221,7 @@ function main() {
   }
 }
 
-process.exit(main());
+// 常驻命令（auto listen）返回 null——它要一直跑着，这里不能 exit，
+// 否则刚起来的监听进程当场被自己杀掉。
+const 退出码 = main();
+if (退出码 !== null) process.exit(退出码);
