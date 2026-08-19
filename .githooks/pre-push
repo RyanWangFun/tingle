@@ -1,0 +1,5 @@
+#!/bin/sh
+# 发版前检查：机械事实由程序判，不靠人记。
+# 启用（每台开发机一次）：git config core.hooksPath .githooks
+# 确需绕过时：git push --no-verify
+exec python3 "$(git rev-parse --show-toplevel)/scripts/check-release.py"
