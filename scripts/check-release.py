@@ -197,6 +197,62 @@ def check_leaks():
                     fail(f"[泄漏] {rel}:{i} 命中不该进公开仓的内容：{line.strip()[:80]}")
 
 
+# ── 6. 生产端与消费端的契约对得上 ──────────────────────────────────────────
+#   起因：把「品牌项目红线」从归集件改成判据件（每条要带「该怎么改」）之后，
+#   11 个消费者的就绪判据仍是照旧形态写的，没有一条要改法——一份旧形状的件
+#   能通过全部 11 道闸，那次升级在下游零效果，而且无处报错。
+#   根因与「同一批事实四处各存一份手写副本」同类，只是换了层级：一份契约
+#   的两端各写各的，改一端另一端不会响。故交程序判。
+def check_input_contract(skills):
+    manifest_owner = "project-readiness"
+    if manifest_owner not in skills:
+        return
+    text = skills[manifest_owner]["text"]
+    m = re.search(r"<!-- DISTILL-MANIFEST BEGIN -->(.*?)<!-- DISTILL-MANIFEST END -->",
+                  text, re.S)
+    if not m:
+        fail(f"[契约] {manifest_owner} 里找不到认知件清单块（DISTILL-MANIFEST 标记）")
+        return
+    block = m.group(1)
+
+    # 6.1 清单块必须是合法 YAML——这块栽过两次（值以 * 开头被当锚点；一个键
+    #     既给值又挂下级键）。坏了不报错，只是下游读它的模型自己猜。
+    ym = re.search(r"```yaml\n(.*?)\n```", block, re.S)
+    if not ym:
+        fail("[契约] 认知件清单块里没有 yaml 代码块")
+        return
+    try:
+        import yaml
+        try:
+            yaml.safe_load(ym.group(1))
+        except Exception as e:
+            first = str(e).strip().splitlines()[0]
+            fail(f"[契约] 认知件清单块不是合法 YAML：{first}")
+    except ImportError:
+        note("[契约] 未装 PyYAML，跳过清单块的 YAML 合法性检查（pip install pyyaml 可开启）")
+
+    # 6.2 件名 → 形态
+    forms = dict(re.findall(r"- 件名:\s*(\S+)\s*\n\s*形态:\s*(\S+)", block))
+    if not forms:
+        fail("[契约] 认知件清单块里解析不出任何「件名 / 形态」")
+        return
+
+    # 6.3 消费端：produced_by 为 context-distill 的每一处声明
+    for d, sk in sorted(skills.items()):
+        for dm in re.finditer(
+                r'"([^"]+)":\s*\{[^{}]*?"就绪判据":\s*\[(.*?)\][^{}]*?"produced_by":\s*"context-distill"',
+                sk["text"], re.S):
+            item, crit = dm.group(1), dm.group(2)
+            form = forms.get(item)
+            if form is None:
+                # 不在清单里 = 第四意图的 skill 专用输入件，另有一套，不在本检查范围
+                continue
+            if form == "判据件" and "改法" not in crit:
+                fail(f"[契约] {d} 向「{item}」要的就绪判据里没有「改法」——"
+                     f"该件形态是判据件（每条须带『该怎么改』），"
+                     f"判据不要它，等于用旧形态的尺子量新形态的件")
+
+
 def main():
     quiet = "--quiet" in sys.argv
     skills = collect_skills()
@@ -205,6 +261,7 @@ def main():
     check_counts(skills)
     check_readme_listing(skills)
     check_leaks()
+    check_input_contract(skills)
 
     if problems:
         print(f"\n✗ 发版检查未通过（{len(problems)} 项）\n")
