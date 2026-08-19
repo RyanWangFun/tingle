@@ -31,7 +31,7 @@ const { execFileSync } = require('child_process');
 
 const STATE_VERSION = 2;      // 本地指针 .tingle/state.json 的结构版本
 const PROFILE_VERSION = 2;    // 项目档案的结构版本
-const RESIDENT_VERSION = 1;   // 常驻件模版的结构版本
+const RESIDENT_VERSION = 2;   // 常驻件模版的结构版本
 
 const STATE_REL = path.join('.tingle', 'state.json');
 const CACHE_DIR_REL = path.join('.tingle', 'cache');
@@ -324,7 +324,7 @@ function probe(type, cfg) {
   if (type === 'lark-base') {
     const r = larkJson([
       'base', '+base-get',
-      '--app-token', cfg.base_token,
+      '--base-token', cfg.base_token,
       '--json',
     ]);
     if (!r.ok) return { ok: false, error: r.error || '多维表格打不开' };
